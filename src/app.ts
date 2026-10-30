@@ -38,7 +38,8 @@ function publicDto(r: any) {
 }
 function fullDto(r: any) {
   return { ...publicDto(r), location: { lat: r.lat, lon: r.lon }, danger_flag: r.danger_flag, route_reason: r.route_reason, route_overridden: r.route_overridden,
-    reopen_count: r.reopen_count, fixed_at: r.fixed_at, copy_org: r.copy_org_name ?? null };
+    reopen_count: r.reopen_count, fixed_at: r.fixed_at, copy_org: r.copy_org_name ?? null,
+    responsible_org_id: r.responsible_org_id ?? null, copy_org_id: r.copy_org_id ?? null, review_org_id: r.review_org_id ?? null };
 }
 
 export async function buildApp(deps: Deps): Promise<FastifyInstance> {
@@ -222,7 +223,10 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
     if (!isStaffOf(issue, ms, ['admin', 'officer', 'contractor', 'utility']) && !isReviewer(issue, ms) && !(await isReporter(db, id, p.userId))) return { ...publicDto(issue), triage_only: true }; // triage view: public-level fields only
     const events = (await db.query('SELECT id, kind, from_status, to_status, reason, actor_id IS NULL AS system, created_at FROM status_events WHERE issue_id=$1 ORDER BY id', [id])).rows;
     const ev = (await db.query('SELECT id, kind, location_ok, created_at FROM evidence WHERE issue_id=$1 ORDER BY created_at', [id])).rows;
-    return { ...fullDto(issue), events, evidence: ev, redaction: 'none (photos are never public)' };
+    // Dispute ids go only to staff of the issue's orgs (contractor/utility raise, municipal staff decide). Reporters never see them.
+    const staffView = isStaffOf(issue, ms, ['admin', 'officer', 'contractor', 'utility']);
+    const disputes = staffView ? (await db.query('SELECT id, status, reason, org_id, evidence_id, created_at, decided_at, decision_reason FROM disputes WHERE issue_id=$1 ORDER BY created_at', [id])).rows : undefined;
+    return { ...fullDto(issue), events, evidence: ev, ...(disputes ? { disputes } : {}), redaction: 'none (photos are never public)' };
   });
 
   // ---------- public, no login ----------

@@ -65,3 +65,7 @@ GET /health shows policy "PROVISIONAL-dev-defaults-not-for-real-use" unless set 
 
 ### Unrouted-report triage is OFF by default
 `POST /v1/issues/:id/claim-review` and the shared view of unrouted reports only work when `POLICY_UNROUTED_TRIAGE=any_municipal_staff` (provisional, synthetic-demo use; `/health` shows `unrouted_triage`). Default `off`: such reports are visible only to their reporters and need an operator to decide ownership. In triage the viewer gets public-level fields only (rounded location, `triage_only:true`, no events, evidence, reporter or danger flag) until their municipality claims it.
+
+
+## Dispute ids and org ids (local change, not yet committed)
+`GET /v1/issues/:id` returns `disputes[]` (id, status, reason, org_id, evidence_id, created_at, decided_at, decision_reason) only to staff of the responsible or copy organisation. Reporters, other organisations and public routes never get dispute ids. The authenticated issue view (not public) also carries `responsible_org_id`, `copy_org_id`, `review_org_id`.

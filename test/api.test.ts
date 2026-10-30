@@ -214,6 +214,16 @@ test('disputes: window, who may raise, officer decision re-routes, evidence owne
   assert.equal(d.status, 201);
   assert.equal((await s.contractor.c.post(`/v1/issues/${iss.id}/dispute`, { reason: 'Telecom trench cut here again' })).status, 409);
   assert.equal((await s.contractor.c.post(`/v1/disputes/${d.json.dispute_id}/decide`, { decision: 'upheld', reason: 'I decide for myself' })).status, 404);
+  // dispute id is discoverable by authorised staff only; reporters and other orgs never get it
+  const sv = (await s.officer.c.get(`/v1/issues/${iss.id}`)).json;
+  assert.equal(sv.disputes.length, 1); assert.equal(sv.disputes[0].id, d.json.dispute_id); assert.equal(sv.disputes[0].status, 'open');
+  assert.ok(sv.responsible_org_id && 'copy_org_id' in sv && 'review_org_id' in sv);
+  assert.equal((await s.contractor.c.get(`/v1/issues/${iss.id}`)).json.disputes[0].id, d.json.dispute_id);
+  const rv = (await r.c.get(`/v1/issues/${iss.id}`)).json;
+  assert.equal(rv.disputes, undefined); assert.ok(!JSON.stringify(rv).includes(d.json.dispute_id));
+  assert.equal((await other.c.get(`/v1/issues/${iss.id}`)).status, 404);
+  const pubd = await w.app.inject({ method: 'GET', url: `/v1/public/issues/${iss.id}` });
+  assert.ok(!JSON.stringify(pubd.json()).includes(d.json.dispute_id)); assert.ok(!('responsible_org_id' in pubd.json()));
   assert.equal((await s.officer.c.post(`/v1/disputes/${d.json.dispute_id}/decide`, { decision: 'upheld', reason: 'ok' })).status, 400);
   const dec = await s.officer.c.post(`/v1/disputes/${d.json.dispute_id}/decide`, { decision: 'upheld', reason: 'Utility cut log confirms trench' });
   assert.equal(dec.status, 200);
