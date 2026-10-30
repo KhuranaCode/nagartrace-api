@@ -29,6 +29,42 @@
     }
    }
   },
+  "/v1/ai/status": {
+   "get": {
+    "summary": "AI advisory availability; always 200 with {configured,available,reason?} for signed-in users",
+    "security": [
+     {
+      "bearer": []
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     },
+     "4XX": {
+      "description": "{error,message}; hidden records return 404"
+     }
+    }
+   }
+  },
+  "/v1/ai/report-check": {
+   "post": {
+    "summary": "AI advisory on a draft report; 503 {ai_available:false,reason} when the laptop AI is offline - never a fabricated suggestion",
+    "security": [
+     {
+      "bearer": []
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     },
+     "4XX": {
+      "description": "{error,message}; hidden records return 404"
+     }
+    }
+   }
+  },
   "/v1/me": {
    "get": {
     "summary": "Current user (creates citizen on first call)",

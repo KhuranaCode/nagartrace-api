@@ -4,6 +4,7 @@ import { z } from 'zod';
 import type pg from 'pg';
 import type { Config } from './config.ts';
 import { authenticate, HttpError, memberships, type KeyResolver, type Membership, type Principal } from './auth.ts';
+import { laptopAiStatus, reportCheck, LaptopAiError } from './laptop-ai.ts';
 import { awardPoints, deadlineHours, lockIssue, recordEvent, routeIssue, runEscalations, severityOf, transition } from './domain.ts';
 import { registerStreakRoutes } from './streaks.ts';
 import { registerFollowupRoutes } from './followup.ts';
@@ -187,6 +188,30 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
       [issueId, userId, s.storage_key, s.sha256, s.content_type, s.byte_size, s.width, s.height, s.claimed_geom]);
     return { evidence_id: ev.rows[0].id as string, location_ok: true };
   }
+
+  // ---------- laptop AI (owner-hosted, honest offline) ----------
+  app.get('/v1/ai/status', async (req) => {
+    await auth(req); // signed-in users only; no public inference probe
+    return laptopAiStatus({ url: cfg.laptopAiUrl, token: cfg.laptopAiToken, model: cfg.laptopAiModel, timeoutMs: cfg.laptopAiTimeoutMs });
+  });
+
+  app.post('/v1/ai/report-check', async (req, reply) => {
+    await auth(req);
+    const b = (req.body ?? {}) as { hazard?: string; note?: string; lat?: number; lon?: number; ward?: string };
+    if (typeof b.hazard !== 'string' || typeof b.lat !== 'number' || typeof b.lon !== 'number') {
+      throw new HttpError(400, 'hazard, lat and lon are required.', 'bad_request');
+    }
+    try {
+      const advisory = await reportCheck({ url: cfg.laptopAiUrl, token: cfg.laptopAiToken, model: cfg.laptopAiModel, timeoutMs: cfg.laptopAiTimeoutMs },
+        { hazard: b.hazard, note: typeof b.note === 'string' ? b.note.slice(0, 2000) : undefined, lat: b.lat, lon: b.lon, ward: typeof b.ward === 'string' ? b.ward : undefined });
+      return { ai_available: true, advisory };
+    } catch (e) {
+      if (e instanceof LaptopAiError) {
+        return reply.code(503).send({ ai_available: false, reason: e.reason });
+      }
+      throw e;
+    }
+  });
 
   app.post('/v1/reports', async (req, reply) => {
     const p = await auth(req);

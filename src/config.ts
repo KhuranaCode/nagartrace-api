@@ -26,6 +26,11 @@ export type Config = {
   level2DelayHours: number;
   publicScorecards: boolean;
   photoRequired: boolean;
+  /** Authenticated bridge to the owner's own laptop inference (Qwen via Ollama). Unset = AI off, honestly reported. */
+  laptopAiUrl?: string;
+  laptopAiToken?: string;
+  laptopAiModel: string;
+  laptopAiTimeoutMs: number;
   /** Product requirement: new reports must bind a staged photo. FALSE during the client rollout window; the deployment owner sets PHOTO_REQUIRED=true once the web client stages photos. Server-enforced when true - no bypass route. */
   rateLimitMax: number;
   /** Follow-up reminder pipeline routes + sweep job. Default OFF; the deployment owner flips FOLLOWUP_PIPELINE=true AFTER migration 011 is applied (coordinated). When off, the routes return 404 and clients show the static honest fallback. */
@@ -54,6 +59,8 @@ export function defaults(): Omit<Config, 'authIssuer' | 'authAudience' | 'databa
     level2DelayHours: 48, // ASSUMPTION
     publicScorecards: false, // PRD: legal review before publishing contractor performance
     photoRequired: false, // flipped by the deployment owner after the photo-staging client is live
+    laptopAiModel: 'qwen3.5:4b',
+    laptopAiTimeoutMs: 25000,
     rateLimitMax: 120,
     followupPipeline: false, // flipped by the deployment owner after migration 011 is applied
   };
@@ -99,6 +106,10 @@ export function fromEnv(env = process.env): Config {
     trustProxy: env.TRUST_PROXY === 'true',
     publicScorecards: env.PUBLIC_SCORECARDS === 'true',
     photoRequired: env.PHOTO_REQUIRED === 'true',
+    laptopAiUrl: env.LAPTOP_AI_URL || undefined,
+    laptopAiToken: env.LAPTOP_AI_TOKEN || undefined,
+    laptopAiModel: env.LAPTOP_AI_MODEL ?? 'qwen3.5:4b',
+    laptopAiTimeoutMs: Number(env.LAPTOP_AI_TIMEOUT_MS ?? 25000),
     followupPipeline: env.FOLLOWUP_PIPELINE === 'true',
   } as Config;
 }
