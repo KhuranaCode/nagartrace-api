@@ -8,8 +8,8 @@ db/, db-pending/, and confirm with the infra peer.
 | Number | Lane | Status |
 | --- | --- | --- |
 | 001-008 | core schema .. staged uploads | merged, live |
-| 009 | road registry (government road DB) | RESERVED - draft, not merged |
-| 010 | NHAI award/contract records | RESERVED - draft, not merged |
+| 009 | road registry staging (OSM geometry) | branch feat/gov-records, pending review |
+| 010 | NHAI award records + seed in db-pending/010_seed | branch feat/gov-records, pending review |
 | 011 | followup reminder pipeline | RESERVED - in db-pending/, held for review-gated apply |
 | 012 | complaint IDs (complaint_no sequence) | branch feat/complaint-ids, unmerged |
 
