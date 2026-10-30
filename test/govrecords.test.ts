@@ -41,10 +41,12 @@ test('official records: nearest NH road joins its exact-token NHAI awards only',
     assert.equal(r.road?.name, 'NH 44 Strip');
     assert.equal(r.road?.maintainer, 'unknown');
     assert.equal((r.road as any).operator, undefined, 'raw OSM operator tag never served');
-    assert.equal(r.nhai_awards.length, 2);
-    const contractors = r.nhai_awards.map((a: any) => a.contractor_name).sort();
+    assert.equal(r.candidate_awards.length, 2);
+    const contractors = r.candidate_awards.map((a: any) => a.contractor_name).sort();
     assert.deepEqual(contractors, ['Real Builder One', 'Real Builder Two']);
     assert.match(r.coverage_note, /exact official section text/);
+    assert.match(r.candidate_warning, /NOT this report's verified contractor/);
+    assert.match(r.candidate_warning, /no chainage-level resolution/);
   } finally { await w.close(); }
 });
 
@@ -55,19 +57,19 @@ test('official records: honest absences - no road, non-NH road, NH with no FY aw
     // no road anywhere near
     let r = await officialRecordsForPoint(w.adminDb, 25.0, 85.0);
     assert.equal(r.road, null);
-    assert.equal(r.nhai_awards.length, 0);
+    assert.equal(r.candidate_awards.length, 0);
     assert.match(r.coverage_note, /partial/);
     // city street with name but no NH ref
     await insertRoad2(w, { name: 'Bus Stand Road', ref: null });
     r = await officialRecordsForPoint(w.adminDb, 30.7005, 76.7005);
     assert.equal(r.road?.name, 'Bus Stand Road');
-    assert.equal(r.nhai_awards.length, 0);
+    assert.equal(r.candidate_awards.length, 0);
     assert.match(r.coverage_note, /maintainer stays unknown/);
     // NH road with no award rows at all
     await insertRoad2(w, { name: 'NH 99 Strip', ref: 'NH-99', lat: 30.9, lon: 76.9 });
     r = await officialRecordsForPoint(w.adminDb, 30.9005, 76.9005);
     assert.equal(r.road?.ref, 'NH-99');
-    assert.equal(r.nhai_awards.length, 0);
+    assert.equal(r.candidate_awards.length, 0);
     assert.match(r.coverage_note, /FY2024-25 only/);
   } finally { await w.close(); }
 });
@@ -85,10 +87,10 @@ test('HTTP: public issue detail carries official_records; browse endpoint serves
     const pub = await client(w, await sign('gov-b')).get(`/v1/public/issues/${id}`);
     assert.equal(pub.status, 200);
     assert.equal(pub.json.official_records.road.name, 'NH 44 Strip');
-    assert.equal(pub.json.official_records.nhai_awards[0].contractor_name, 'Real Builder One');
+    assert.equal(pub.json.official_records.candidate_awards[0].contractor_name, 'Real Builder One');
     const det = await a.get(`/v1/issues/${id}`);
     assert.equal(det.status, 200);
-    assert.equal(det.json.official_records.nhai_awards.length, 1);
+    assert.equal(det.json.official_records.candidate_awards.length, 1);
     // browse
     const all = await a.get('/v1/public/gov-records/nhai-awards');
     assert.equal(all.status, 200);
@@ -99,5 +101,43 @@ test('HTTP: public issue detail carries official_records; browse endpoint serves
     assert.equal(byState.json.awards.length, 1);
     const byNh = await a.get('/v1/public/gov-records/nhai-awards?nh=NH-48');
     assert.equal(byNh.json.awards.length, 0);
+    // regressions (review findings): malformed nh -> 400, never broad results; candidate semantics explicit
+    const bad = await a.get('/v1/public/gov-records/nhai-awards?nh=abc');
+    assert.equal(bad.status, 400);
+    assert.equal(bad.json.error, 'validation');
+    const bad2 = await a.get('/v1/public/gov-records/nhai-awards?nh=NH-');
+    assert.equal(bad2.status, 400);
+    for (const v of ['definitelyinvalid', 'NH--44', 'SR44', 'SH44', 'SR 44']) {
+      const r2 = await a.get(`/v1/public/gov-records/nhai-awards?nh=${encodeURIComponent(v)}`);
+      assert.equal(r2.status, 400, `nh=${v} must not broaden to all awards`);
+    }
+    assert.equal(pub.json.official_records.responsible_contractor, 'unknown');
+    assert.equal(pub.json.official_records.candidate_awards[0].match_status, 'candidate');
+    assert.match(pub.json.official_records.coverage_note, /responsible contractor for this report is UNKNOWN/);
+  } finally { await w.close(); }
+});
+
+test('PUBLIC PRECISION: public official_records derive from the public rounded point only', async () => {
+  const w = await newWorld();
+  try {
+    await seed(w);
+    await insertRoad2(w, { name: 'NH 44 Strip', ref: 'NH-44' });
+    await insertAward(w, { sr: 902, nh: ['44'], contractor: 'Real Builder One' });
+    const a = client(w, await sign('gov-a'));
+    // raw point slightly offset from the road; its 1e4-rounded public point differs in distance
+    const rep = await a.post('/v1/reports', reportBody({ lat: 30.70019, lon: 76.70004 })); // off the diagonal: rounding changes the derived distance
+    assert.equal(rep.status, 201);
+    const id = rep.json.issue.id;
+    const pub = await client(w, await sign('gov-b')).get(`/v1/public/issues/${id}`);
+    assert.equal(pub.status, 200);
+    const loc = pub.json.location;
+    assert.equal(loc.lat, Math.round(30.70019 * 1e4) / 1e4);
+    const atPublicPoint = JSON.parse(JSON.stringify(await officialRecordsForPoint(w.adminDb, loc.lat, loc.lon))); // JSON-normalized like the wire
+    assert.deepEqual(pub.json.official_records, atPublicPoint);
+    const atPrivatePoint = await officialRecordsForPoint(w.adminDb, 30.70019, 76.70004);
+    if (atPrivatePoint.road && atPublicPoint.road) assert.notEqual(atPrivatePoint.road.distance_m, atPublicPoint.road.distance_m, 'regression needs a point where rounding changes the derived distance');
+    // hidden-404 for non-reporter non-staff is retained
+    const tri = await client(w, await sign('gov-c')).get(`/v1/issues/${id}`);
+    assert.equal(tri.status, 404);
   } finally { await w.close(); }
 });

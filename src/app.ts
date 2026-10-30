@@ -35,6 +35,11 @@ const ISSUE_FROM = `FROM issues i LEFT JOIN orgs ro ON ro.id=i.responsible_org_i
 export const complaintId = (no: number | string | null | undefined) =>
   no == null ? null : `NT-${String(no).padStart(6, '0')}`;
 
+/** Official records for a PUBLIC view: computed from the same rounded point the public sees,
+ *  so nearest-road selection and derived distances can never leak finer private precision. */
+async function publicOfficialRecords(db: pg.Pool, r: any) {
+  return officialRecordsForPoint(db, Math.round(r.lat * 1e4) / 1e4, Math.round(r.lon * 1e4) / 1e4);
+}
 function publicDto(r: any) {
   return {
     id: r.id, complaint_no: r.complaint_no == null ? null : Number(r.complaint_no), complaint_id: complaintId(r.complaint_no == null ? null : Number(r.complaint_no)), hazard: r.hazard, status: r.status, severity: r.severity, ward: r.ward,
@@ -303,7 +308,7 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
     const issue = r.rows[0];
     const staff = isStaffOf(issue, ms, ['admin', 'officer', 'contractor', 'utility']) || isReviewer(issue, ms) || isTriager(issue, ms);
     if (!staff && !(await isReporter(db, id, p.userId))) throw new HttpError(404, 'Issue not found', 'not_found');
-    if (!isStaffOf(issue, ms, ['admin', 'officer', 'contractor', 'utility']) && !isReviewer(issue, ms) && !(await isReporter(db, id, p.userId))) return { ...publicDto(issue), triage_only: true, official_records: await officialRecordsForPoint(db, issue.lat, issue.lon) }; // triage view: public-level fields + official records
+    if (!isStaffOf(issue, ms, ['admin', 'officer', 'contractor', 'utility']) && !isReviewer(issue, ms) && !(await isReporter(db, id, p.userId))) return { ...publicDto(issue), triage_only: true, official_records: await publicOfficialRecords(db, issue) }; // triage view: public-level fields + official records from the public point
     const events = (await db.query('SELECT id, kind, from_status, to_status, reason, actor_id IS NULL AS system, created_at FROM status_events WHERE issue_id=$1 ORDER BY id', [id])).rows;
     const ev = (await db.query('SELECT id, kind, location_ok, created_at FROM evidence WHERE issue_id=$1 ORDER BY created_at', [id])).rows;
     // Dispute ids go only to staff of the issue's orgs (contractor/utility raise, municipal staff decide). Reporters never see them.
@@ -323,7 +328,7 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
     const r = await db.query(`SELECT ${ISSUE_COLS} ${ISSUE_FROM} WHERE i.id=$1`, [id]);
     if (!r.rowCount || r.rows[0].is_test) throw new HttpError(404, 'Issue not found', 'not_found');
     const row = r.rows[0];
-    return { ...publicDto(row), official_records: await officialRecordsForPoint(db, row.lat, row.lon) };
+    return { ...publicDto(row), official_records: await publicOfficialRecords(db, row) };
   });
   app.get('/v1/public/gov-records/nhai-awards', async (req) => {
     const q = parse(z.object({ state: z.string().max(60).optional(), nh: z.string().max(20).optional(), limit: z.coerce.number().int().min(1).max(352).default(100) }).strict(), req.query);

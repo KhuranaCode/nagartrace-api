@@ -11,7 +11,7 @@ db/, db-pending/, and confirm with the infra peer.
 | 009 | road registry staging (OSM geometry) | branch feat/gov-records, pending review |
 | 010 | NHAI award records + seed in db-pending/010_seed | branch feat/gov-records, pending review |
 | 011 | followup reminder pipeline | RESERVED - in db-pending/, held for review-gated apply |
-| 012 | complaint IDs (complaint_no sequence) | branch feat/complaint-ids, unmerged |
+| 012 | complaint IDs (complaint_no sequence) | applied on main (f188141), live |
 
 Collision history: complaint IDs were first drafted as 009 (collided with road), then 010
 (collided with NHAI draft). Do not renumber into a reserved slot; pick the next free number
