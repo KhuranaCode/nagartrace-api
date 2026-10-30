@@ -105,6 +105,6 @@ export async function nhaiAwardsBrowse(db: pg.Pool | pg.PoolClient, q: { state?:
   const total = (await db.query('SELECT count(*)::int AS c, min(source_label) AS sl FROM nhai_award_records')).rows[0];
   return {
     awards: r.rows,
-    dataset: { rows: total.c, source_label: total.sl, coverage: 'NHAI Awarded Projects FY2024-25 (historical snapshot)', anomaly_note: 'One source row (sr 20) carries an apparent unit error in awarded_cost_cr, kept verbatim; treat aggregates with care.' },
+    dataset: { rows: total.c, source_label: total.sl, coverage: 'NHAI Awarded Projects FY2024-25 (historical snapshot)', anomaly_note: 'One source row (sr 20) carries an unusually large awarded_cost_cr value, preserved verbatim from the official source; no totals or aggregates are computed from these values.' },
   };
 }

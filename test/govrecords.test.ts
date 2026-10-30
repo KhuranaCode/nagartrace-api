@@ -125,6 +125,8 @@ test('HTTP: public issue detail carries official_records; browse endpoint serves
     assert.equal(all.json.awards.length, 1);
     assert.match(all.json.dataset.coverage, /FY2024-25/);
     assert.match(all.json.dataset.anomaly_note, /sr 20/);
+    assert.match(all.json.dataset.anomaly_note, /preserved verbatim/);
+    assert.doesNotMatch(all.json.dataset.anomaly_note, /unit error/);
     const byState = await a.get('/v1/public/gov-records/nhai-awards?state=punjab');
     assert.equal(byState.json.awards.length, 1);
     const byNh = await a.get('/v1/public/gov-records/nhai-awards?nh=NH-48');
