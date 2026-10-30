@@ -229,6 +229,8 @@ export function registerGmailRoutes(app: FastifyInstance, deps: { cfg: Config; d
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id`,
       [issueId, p.userId, to, subject, body_text, bodySha, status, gmsgId, gthreadId, gerr, idempotency_key]);
     // 'accepted' = Gmail accepted the message (id returned). NEVER presented as delivered.
-    return reply.status(status === 'accepted' ? 201 : 502).send({ email_id: ins.rows[0].id, status, gmail_message_id: gmsgId });
+    // 201 for every RECORDED attempt - the attempt row is the created resource; the
+    // status field carries the outcome truth (accepted/failed/unknown), never hidden in HTTP codes.
+    return reply.status(201).send({ email_id: ins.rows[0].id, status, gmail_message_id: gmsgId });
   });
 }

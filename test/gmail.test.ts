@@ -148,19 +148,19 @@ test('authority send: exact body sha stored, accepted-never-delivered, replay/id
   google.sendPlan = () => ({ status: 500, json: async () => ({}) });
   const sendsBefore2 = google.sendCalls;
   const s4 = await c.post(`/v1/issues/${issueId}/authority-emails`, { ...body, idempotency_key: 'gm-' + uniq() });
-  assert.equal(s4.status, 502); assert.equal(s4.json.status, 'unknown');
+  assert.equal(s4.status, 201); assert.equal(s4.json.status, 'unknown');
   assert.equal(google.sendCalls, sendsBefore2 + 1);
   const unk = (await w.adminDb.query(`SELECT status, gmail_message_id FROM authority_email WHERE id=$1`, [s4.json.email_id])).rows[0];
   assert.equal(unk.status, 'unknown'); assert.equal(unk.gmail_message_id, null);
   // Gmail definitive rejection (4xx): recorded 'failed'
   google.sendPlan = () => ({ status: 403, json: async () => ({}) });
   const s5 = await c.post(`/v1/issues/${issueId}/authority-emails`, { ...body, idempotency_key: 'gm-' + uniq() });
-  assert.equal(s5.status, 502); assert.equal(s5.json.status, 'failed');
+  assert.equal(s5.status, 201); assert.equal(s5.json.status, 'failed');
   // Transport failure (timeout): Gmail may have received it -> 'unknown'
   google.sendPlan = () => { throw Object.assign(new Error('timed out'), { name: 'TimeoutError' }); };
   const sendsBefore3 = google.sendCalls;
   const s6 = await c.post(`/v1/issues/${issueId}/authority-emails`, { ...body, idempotency_key: 'gm-' + uniq() });
-  assert.equal(s6.status, 502); assert.equal(s6.json.status, 'unknown');
+  assert.equal(s6.status, 201); assert.equal(s6.json.status, 'unknown');
   assert.equal(google.sendCalls, sendsBefore3 + 1, 'one attempt, never an automatic retry');
   const unk2 = (await w.adminDb.query(`SELECT status, error FROM authority_email WHERE id=$1`, [s6.json.email_id])).rows[0];
   assert.equal(unk2.status, 'unknown'); assert.equal(unk2.error, 'gmail_timeout');
