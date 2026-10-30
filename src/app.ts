@@ -329,6 +329,18 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
     // z.number() here rejected every call with 400; caught by peer's live run).
     const q = parse(z.object({ lat: z.coerce.number().min(-90).max(90), lon: z.coerce.number().min(-180).max(180) }), req.query);
     if (!Buffer.isBuffer(req.body)) throw new HttpError(415, 'Send the image as the raw request body (image/jpeg, image/png or image/webp)', 'bad_image');
+    // Cheap pre-check BEFORE any expensive work (decode, blob write): reject accounts
+    // already at the staging limits so a flood costs a count query, not storage. This
+    // read is deliberately unlocked - it can lag under a burst, so the authoritative
+    // check below runs again inside the per-account advisory lock; anything the
+    // pre-check misses is caught there and its blob deleted. Exactness lives in the
+    // lock; this exists only to protect resources.
+    const pre = (await db.query(
+      `SELECT count(*) FILTER (WHERE consumed_at IS NULL AND expires_at > now())::int AS pending,
+              count(*) FILTER (WHERE created_at > now() - interval '1 hour')::int AS recent
+       FROM staged_uploads WHERE uploader_id=$1`, [p.userId])).rows[0];
+    if (pre.pending >= 5) throw new HttpError(429, 'You have several staged photos waiting. Submit a report with one, or wait for them to expire (1 hour).', 'too_many_staged');
+    if (pre.recent >= 30) throw new HttpError(429, 'Too many photo uploads - try again later.', 'rate_limited');
     // normalizeImage: 8 MB cap (Fastify bodyLimit 10 MB), magic-byte sniffing, bounded
     // pixel decode (24 MP), EXIF orientation applied, then everything re-encoded to
     // fresh JPEG - EXIF (incl. any embedded GPS) is stripped and never read.
