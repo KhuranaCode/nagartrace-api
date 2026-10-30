@@ -30,6 +30,10 @@ export type Config = {
   rateLimitMax: number;
   /** Follow-up reminder pipeline routes + sweep job. Default OFF; the deployment owner flips FOLLOWUP_PIPELINE=true AFTER migration 011 is applied (coordinated). When off, the routes return 404 and clients show the static honest fallback. */
   followupPipeline: boolean;
+  /** Public anon key of the Supabase project (NOT a secret - it is embedded in the web client bundle).
+   *  Enables the least-privilege verified-email self-lookup: GET {authIssuer}/user with the REQUESTER'S
+   *  own access token; no service role anywhere. Unset => lookup disabled, signin_email_unavailable stays. */
+  supabaseAnonKey?: string;
 };
 
 export function defaults(): Omit<Config, 'authIssuer' | 'authAudience' | 'databaseUrl'> {
@@ -100,5 +104,6 @@ export function fromEnv(env = process.env): Config {
     publicScorecards: env.PUBLIC_SCORECARDS === 'true',
     photoRequired: env.PHOTO_REQUIRED === 'true',
     followupPipeline: env.FOLLOWUP_PIPELINE === 'true',
+    supabaseAnonKey: env.SUPABASE_ANON_KEY || undefined,
   } as Config;
 }

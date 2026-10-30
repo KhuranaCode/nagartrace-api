@@ -42,18 +42,47 @@
  * scope. The conditional writes guarantee no state corruption regardless.
  *
  * Verified recipient: Principal.email is set ONLY when the issuer's token carries an explicit
- * verified marker (email_verified === true, top-level or user_metadata). Supabase access
- * tokens document NO email-verification claim (official JWT fields reference,
- * supabase.com/docs/guides/auth/jwt-fields, read 2026-10-30: email + user_metadata only), so
- * with a stock Supabase issuer campaign creation honestly returns signin_email_unavailable.
- * Binding to a server-confirmed address is owner-surface future scope (Supabase project
- * settings / Management API), coordinated via the infra owner - NOT assumed here.
+ * verified marker (top-level email_verified === true; user_metadata is USER-EDITABLE and never
+ * a verification source). Supabase access tokens document NO email-verification claim
+ * (official JWT fields reference, supabase.com/docs/guides/auth/jwt-fields, read 2026-10-30:
+ * email + user_metadata only). The fallback binding is the LEAST-PRIVILEGE issuer self-lookup
+ * (see resolveVerifiedEmail below): the requester's OWN token against the issuer's OWN
+ * /auth/v1/user endpoint; an address binds ONLY when the issuer's record shows it confirmed.
+ * No service role, no Management API, no admin surface. When neither path yields a confirmed
+ * address, campaign creation honestly returns signin_email_unavailable.
  */
 import { createHash } from 'node:crypto';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import type pg from 'pg';
 import { authenticate, HttpError, memberships, type KeyResolver } from './auth.ts';
 import type { Config } from './config.ts';
+
+
+/**
+ * Least-privilege verified-email binding (peer-settled direction; service-role route rejected).
+ * Asks the ISSUER, with the requester's OWN bearer token, whether the sign-in address is
+ * confirmed: GET {cfg.authIssuer}/user (Supabase GoTrue) with the public anon key as apikey.
+ * The URL comes from CONFIG (authIssuer is what the token's signature was verified against),
+ * never from request data. An address binds ONLY on HTTP 200 + string email + non-null
+ * email_confirmed_at - the issuer's own confirmation marker. Any failure (non-200, timeout,
+ * malformed body, unconfirmed) yields null and the caller keeps the honest unavailable state.
+ * The result is used for THIS request only; it is never persisted as a verified address.
+ */
+export async function resolveVerifiedEmail(cfg: Config, authHeader: string | undefined, fetchImpl: typeof fetch): Promise<string | null> {
+  if (!cfg.supabaseAnonKey || !authHeader) return null;
+  const base = cfg.authIssuer.replace(/\/+$/, ''); // e.g. https://<ref>.supabase.co/auth/v1
+  try {
+    const r = await fetchImpl(`${base}/user`, {
+      headers: { apikey: cfg.supabaseAnonKey, authorization: authHeader },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (r.status !== 200) return null;
+    const j: any = await r.json();
+    if (typeof j?.email === 'string' && j.email.length > 0 && j.email.length <= 320
+        && typeof j?.email_confirmed_at === 'string' && j.email_confirmed_at.length > 0) return j.email;
+    return null;
+  } catch { return null; }
+}
 
 const DAY_STAGES = [7, 10, 15, 30] as const;
 /** The exact consent text version the current UI shows. Grants with any other version are
@@ -230,8 +259,9 @@ export async function sweepFollowups(db: pg.Pool, sender: Sender, maxAttempts = 
   return { sent, states };
 }
 
-export function registerFollowupRoutes(app: FastifyInstance, deps: { cfg: Config; db: pg.Pool; keys: KeyResolver }) {
+export function registerFollowupRoutes(app: FastifyInstance, deps: { cfg: Config; db: pg.Pool; keys: KeyResolver; fetchImpl?: typeof fetch }) {
   const { cfg, db, keys } = deps;
+  const fetchImpl = deps.fetchImpl ?? fetch;
   const auth = (req: FastifyRequest) => authenticate(req.headers.authorization, cfg, keys, db);
   const hasIssueAccess = async (issueId: string, userId: string) =>
     !!(await db.query(
@@ -297,11 +327,12 @@ export function registerFollowupRoutes(app: FastifyInstance, deps: { cfg: Config
     let recipientVerified = false;
     if (audience === 'reporter') {
       if (recipient_descriptor !== 'self') throw new HttpError(400, 'reporter campaigns are self-addressed', 'bad_audience');
-      if (!p.email) throw new HttpError(400, 'your sign-in address is not available from this session', 'signin_email_unavailable');
-      if (typeof recipient_email !== 'string' || recipient_email.toLowerCase() !== p.email.toLowerCase())
+      const bound = p.email ?? await resolveVerifiedEmail(cfg, req.headers.authorization, fetchImpl);
+      if (!bound) throw new HttpError(400, 'your sign-in address is not available from this session', 'signin_email_unavailable');
+      if (typeof recipient_email !== 'string' || recipient_email.toLowerCase() !== bound.toLowerCase())
         throw new HttpError(403, 'recipient_email must be your own sign-in address', 'recipient_mismatch');
-      address = p.email;
-      recipientVerified = true; // p.email exists ONLY with an issuer-verified marker (see auth.ts + header)
+      address = bound;
+      recipientVerified = true; // bound is issuer-verified: token claim (auth.ts) or issuer self-lookup confirmation
     }
     const descriptor = audience === 'reporter' ? 'self' : String(recipient_descriptor ?? '');
     if (audience === 'authority' && !descriptor) throw new HttpError(400, 'recipient_required', 'recipient_required');

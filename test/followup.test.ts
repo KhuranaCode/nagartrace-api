@@ -8,7 +8,7 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { newWorld, sign, client, reportBody, P_NOROAD, type World } from './helpers.ts';
+import { newWorld, sign, client, reportBody, P_NOROAD, ISSUER, type World } from './helpers.ts';
 import { sweepFollowups, NoProvider, FOLLOWUP_CONSENT_VERSION, type Sender, type SendInput } from '../src/followup.ts';
 
 let w: World;
@@ -71,6 +71,85 @@ test('access: a non-reporter cannot create or list campaigns on another user\'s 
   assert.equal(r.status, 404);
   const g = await other.c.get(`/v1/issues/${issueId}/followup-campaigns`);
   assert.equal(g.status, 404);
+});
+
+
+test('issuer self-lookup: confirmed email binds; unconfirmed/error stays honestly unavailable', async () => {
+  // A stock Supabase token (NO email claims) + an anon-key-configured issuer endpoint.
+  const calls: { url: string; apikey?: string; auth?: string }[] = [];
+  const responder: { status: number; body: any } = { status: 200, body: { email: 'self@example.in', email_confirmed_at: '2026-01-01T00:00:00Z' } };
+  const fetchImpl = (async (url: any, init: any) => {
+    calls.push({ url: String(url), apikey: init?.headers?.apikey, auth: init?.headers?.authorization });
+    return { status: responder.status, json: async () => responder.body } as any;
+  }) as any;
+  const w2 = await newWorld({ followupPipeline: true, supabaseAnonKey: 'anon-public-test' }, undefined, undefined, { fetchImpl });
+  try {
+    await w2.adminDb.query(fs.readFileSync(path.resolve(import.meta.dirname, '../db-pending/011_followup_pipeline.sql'), 'utf8'));
+    const t = await sign('u-' + uniq()); // no email claims at all: stock Supabase shape
+    const c = client(w2, t);
+    await consent(c);
+    const issueId = await mkIssue(c);
+    const ok = await create(c, issueId, 'k-' + uniq(), 'self@example.in');
+    assert.equal(ok.status, 201, JSON.stringify(ok.json));
+    // Lookup hit the CONFIG-derived issuer URL with the requester's own token, never request data.
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, ISSUER.replace(/\/+$/, '') + '/user');
+    assert.equal(calls[0].apikey, 'anon-public-test');
+    assert.equal(calls[0].auth, 'Bearer ' + t);
+    const g = await c.get(`/v1/issues/${issueId}/followup-campaigns`);
+    assert.equal(g.json.campaigns[0].recipient_address, 'self@example.in');
+    assert.equal(g.json.campaigns[0].recipient_verified, true);
+
+    // Unconfirmed address (email_confirmed_at null): no binding, honest 400.
+    responder.body = { email: 'self@example.in', email_confirmed_at: null };
+    const t2 = await sign('u-' + uniq()); const c2 = client(w2, t2);
+    await consent(c2);
+    const i2 = await mkIssue(c2);
+    assert.equal((await create(c2, i2, 'k-' + uniq(), 'self@example.in')).status, 400);
+
+    // Issuer rejects the token (401): no binding.
+    responder.status = 401; responder.body = { email: 'self@example.in', email_confirmed_at: '2026-01-01T00:00:00Z' };
+    assert.equal((await create(c2, i2, 'k-' + uniq(), 'self@example.in')).status, 400);
+
+    // Lookup throws (network/timeout): no binding.
+    const boom = (async () => { throw new Error('network down'); }) as any;
+    const w3 = await newWorld({ followupPipeline: true, supabaseAnonKey: 'anon-public-test' }, undefined, undefined, { fetchImpl: boom });
+    try {
+      await w3.adminDb.query(fs.readFileSync(path.resolve(import.meta.dirname, '../db-pending/011_followup_pipeline.sql'), 'utf8'));
+      const t3 = await sign('u-' + uniq()); const c3 = client(w3, t3);
+      await consent(c3);
+      const i3 = await mkIssue(c3);
+      assert.equal((await create(c3, i3, 'k-' + uniq(), 'self@example.in')).status, 400);
+    } finally { await w3.close(); }
+
+    // Confirmed via lookup but body email disagrees: 403 recipient_mismatch, never stored.
+    responder.status = 200; responder.body = { email: 'self@example.in', email_confirmed_at: '2026-01-01T00:00:00Z' };
+    const i4 = await mkIssue(c2);
+    assert.equal((await create(c2, i4, 'k-' + uniq(), 'someone-else@example.in')).status, 403);
+
+    // Token claim already verified: the lookup is NOT called (claim path wins).
+    calls.length = 0;
+    const t5 = await sign('u-' + uniq(), { extra: { email: 'claim@example.in', email_verified: true } });
+    const c5 = client(w2, t5);
+    await consent(c5);
+    const i5 = await mkIssue(c5);
+    assert.equal((await create(c5, i5, 'k-' + uniq(), 'claim@example.in')).status, 201);
+    assert.equal(calls.length, 0);
+  } finally { await w2.close(); }
+});
+
+test('issuer self-lookup disabled without an anon key: no lookup attempted', async () => {
+  let called = 0;
+  const spy = (async () => { called++; throw new Error('must not be called'); }) as any;
+  const w4 = await newWorld({ followupPipeline: true }, undefined, undefined, { fetchImpl: spy });
+  try {
+    await w4.adminDb.query(fs.readFileSync(path.resolve(import.meta.dirname, '../db-pending/011_followup_pipeline.sql'), 'utf8'));
+    const t = await sign('u-' + uniq()); const c = client(w4, t);
+    await consent(c);
+    const i = await mkIssue(c);
+    assert.equal((await create(c, i, 'k-' + uniq(), 'x@example.in')).status, 400);
+    assert.equal(called, 0);
+  } finally { await w4.close(); }
 });
 
 test('recipient binding: missing token email 400, mismatched body email 403, bound email 201', async () => {

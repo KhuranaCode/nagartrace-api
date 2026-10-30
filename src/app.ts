@@ -11,7 +11,7 @@ import { normalizeImage } from './images.ts';
 import type { BlobStore } from './storage.ts';
 import { officialRecordsForPoint, nhaiAwardsBrowse } from './govrecords.ts';
 
-export type Deps = { cfg: Config; db: pg.Pool; keys: KeyResolver; store: BlobStore; now?: () => Date };
+export type Deps = { cfg: Config; db: pg.Pool; keys: KeyResolver; store: BlobStore; now?: () => Date; /** Test seam for the issuer self-lookup; production uses global fetch. */ fetchImpl?: typeof fetch };
 
 const HAZARDS = ['pothole', 'crack', 'waterlogging', 'broken_edge', 'missing_cover', 'other'] as const;
 const uuid = z.string().uuid();
@@ -736,7 +736,7 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
   registerStreakRoutes(app, { cfg, db, keys });
   // Follow-up reminder pipeline: mounted only when the deployment owner enables it
   // (FOLLOWUP_PIPELINE=true) after migration 011 is applied. Off => 404 => honest client fallback.
-  if (cfg.followupPipeline) registerFollowupRoutes(app, { cfg, db, keys });
+  if (cfg.followupPipeline) registerFollowupRoutes(app, { cfg, db, keys, fetchImpl: deps.fetchImpl });
 
   return app;
 }
