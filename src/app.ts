@@ -6,6 +6,7 @@ import type { Config } from './config.ts';
 import { authenticate, HttpError, memberships, type KeyResolver, type Membership, type Principal } from './auth.ts';
 import { awardPoints, deadlineHours, lockIssue, recordEvent, routeIssue, runEscalations, severityOf, transition } from './domain.ts';
 import { registerStreakRoutes } from './streaks.ts';
+import { registerFollowupRoutes } from './followup.ts';
 import { normalizeImage } from './images.ts';
 import type { BlobStore } from './storage.ts';
 
@@ -718,6 +719,9 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
   });
 
   registerStreakRoutes(app, { cfg, db, keys });
+  // Follow-up reminder pipeline: mounted only when the deployment owner enables it
+  // (FOLLOWUP_PIPELINE=true) after migration 011 is applied. Off => 404 => honest client fallback.
+  if (cfg.followupPipeline) registerFollowupRoutes(app, { cfg, db, keys });
 
   return app;
 }
