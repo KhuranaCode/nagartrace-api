@@ -229,8 +229,11 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
           // and photo binding (one transaction), so a replay carrying a DIFFERENT
           // upload id is a changed payload with a reused key, not a recovery - 409.
           const orig = ex.rows[0];
+          // Canonical SET compare: a reordered-but-identical hazard set is the same report
+          // (true replay); a changed set is a changed payload (409).
+          const canon = (a: string[]) => [...new Set(a)].sort().join(',');
           if (orig.lat !== b.lat || orig.lon !== b.lon || orig.hazard !== b.hazard
-              || pgEnumArray(orig.hazards).join(',') !== hazardSet.join(','))
+              || canon(pgEnumArray(orig.hazards)) !== canon(hazardSet))
             throw new HttpError(409, 'This idempotency key was already used with a different report', 'idempotency_mismatch');
           const bound = (await c.query(
             `SELECT s.id AS upload_id, e.id AS evidence_id FROM staged_uploads s

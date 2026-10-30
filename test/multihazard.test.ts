@@ -63,4 +63,8 @@ test('idempotent replay compares the full hazard set', async () => {
   assert.equal(r2.json.replayed, true);
   const changed = await c.post('/v1/reports', reportBody({ lat: P_NOROAD.lat + 0.07, lon: P_NOROAD.lon + 0.07 }, { hazard: 'crack', hazards: ['crack'] }), { 'idempotency-key': key });
   assert.equal(changed.status, 409);
+  // Reordered-but-identical set = same report = true replay, not a mismatch.
+  const reordered = await c.post('/v1/reports', reportBody({ lat: P_NOROAD.lat + 0.07, lon: P_NOROAD.lon + 0.07 }, { hazard: 'crack', hazards: ['broken_edge', 'crack'] }), { 'idempotency-key': key });
+  assert.equal(reordered.status, 200);
+  assert.equal(reordered.json.replayed, true);
 });
