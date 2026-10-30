@@ -23,16 +23,20 @@ function parse<T>(schema: z.ZodType<T>, v: unknown): T {
   return r.data;
 }
 
-const ISSUE_COLS = `i.review_org_id, i.id, i.hazard, i.danger_flag, i.severity, i.status, i.ward, i.responsible_kind, i.route_reason, i.route_flags, i.route_overridden,
+const ISSUE_COLS = `i.review_org_id, i.id, i.complaint_no, i.hazard, i.danger_flag, i.severity, i.status, i.ward, i.responsible_kind, i.route_reason, i.route_flags, i.route_overridden,
   i.deadline_at, i.reports_count, i.reopen_count, i.created_at, i.updated_at, i.fixed_at,
   ST_Y(i.geom::geometry) AS lat, ST_X(i.geom::geometry) AS lon,
   i.is_test, ro.id AS responsible_org_id, ro.name AS responsible_org_name, ro.is_synthetic AS responsible_synthetic, co.name AS copy_org_name, i.copy_org_id`;
 const ISSUE_FROM = `FROM issues i LEFT JOIN orgs ro ON ro.id=i.responsible_org_id LEFT JOIN orgs co ON co.id=i.copy_org_id`;
 
 /** Public view: no reporter identity, no evidence, coordinates rounded to ~11 m. */
+/** Human-readable complaint reference, e.g. NT-000123. Stable for the life of the issue. */
+export const complaintId = (no: number | string | null | undefined) =>
+  no == null ? null : `NT-${String(no).padStart(6, '0')}`;
+
 function publicDto(r: any) {
   return {
-    id: r.id, hazard: r.hazard, status: r.status, severity: r.severity, ward: r.ward,
+    id: r.id, complaint_no: r.complaint_no == null ? null : Number(r.complaint_no), complaint_id: complaintId(r.complaint_no == null ? null : Number(r.complaint_no)), hazard: r.hazard, status: r.status, severity: r.severity, ward: r.ward,
     location: { lat: Math.round(r.lat * 1e4) / 1e4, lon: Math.round(r.lon * 1e4) / 1e4 },
     responsible: r.responsible_org_name ? { kind: r.responsible_kind, name: r.responsible_org_name, synthetic_data: !!r.responsible_synthetic } : null,
     deadline_at: r.deadline_at, reports_count: r.reports_count, route_flags: r.route_flags, created_at: r.created_at, updated_at: r.updated_at,
