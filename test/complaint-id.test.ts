@@ -32,8 +32,8 @@ test('complaint ids: every new issue gets a unique, monotonic, human-readable NT
     const det2 = await a.get(`/v1/issues/${i1.id}`);
     assert.equal(det2.json.complaint_id, 'NT-000001', 'id does not change on update');
     // DB-level: unique + not null enforced
-    const dupErr = await w.adminDb.query(`INSERT INTO issues (reporter_id, geom, hazard, severity, complaint_no)
-      SELECT reporter_id, geom, hazard, severity, 1 FROM issues WHERE id=$1`, [i1.id]).then(() => null).catch((e) => e);
+    const dupErr = await w.adminDb.query(`INSERT INTO issues (reporter_id, geom, hazard, hazards, severity, complaint_no)
+      SELECT reporter_id, geom, hazard, hazards, severity, 1 FROM issues WHERE id=$1`, [i1.id]).then(() => null).catch((e) => e);
     assert.ok(dupErr && /duplicate key/.test(dupErr.message), 'complaint_no unique at DB level');
   } finally { await w.close(); }
 });

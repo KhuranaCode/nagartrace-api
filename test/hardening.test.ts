@@ -73,7 +73,7 @@ test('public surface: exact key allowlist, no leaks via errors, ids, aggregates 
   await a.c.upload(`/v1/issues/${iss.id}/evidence?kind=report&lat=30.7&lon=76.7002`, await jpeg());
   const get = async (url: string) => w.app.inject({ method: 'GET', url });
   const one = (await get(`/v1/public/issues/${iss.id}`)).json();
-  assert.deepEqual(Object.keys(one).sort(), ['complaint_id', 'complaint_no', 'created_at', 'deadline_at', 'hazard', 'id', 'location', 'official_records', 'reports_count', 'responsible', 'route_flags', 'severity', 'status', 'updated_at', 'ward'].sort()); // complaint_id is a public display reference, no reporter identity
+  assert.deepEqual(Object.keys(one).sort(), ['complaint_id', 'complaint_no', 'created_at', 'deadline_at', 'hazard', 'hazards', 'id', 'location', 'official_records', 'reports_count', 'responsible', 'route_flags', 'severity', 'status', 'updated_at', 'ward'].sort()); // complaint_id is a public display reference, no reporter identity; hazards is the same already-public hazard class as hazard
   assert.deepEqual(Object.keys(one.official_records).sort(), ['candidate_awards', 'candidate_warning', 'coverage_note', 'responsible_contractor', 'road']); // public government data only: no operator tags, no reporter identity
   assert.deepEqual(Object.keys(one.responsible).sort(), ['kind', 'name', 'synthetic_data']);
   assert.deepEqual(Object.keys(one.location).sort(), ['lat', 'lon']);
