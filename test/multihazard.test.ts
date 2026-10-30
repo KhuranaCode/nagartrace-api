@@ -44,6 +44,39 @@ test('duplicate matching merges on ANY shared hazard and unions the set', async 
   assert.equal(d.hazard, 'pothole'); // primary of the existing issue never changes
 });
 
+test('merged report with a DIFFERENT primary: identical retry replays, promoted primary 409s', async () => {
+  const c1 = await mk(); const c2 = await mk();
+  const la = P_NOROAD.lat + 0.09, lo = P_NOROAD.lon + 0.09;
+  const r1 = await c1.post('/v1/reports', reportBody({ lat: la, lon: lo }, { hazard: 'pothole', hazards: ['pothole', 'crack'] }));
+  assert.equal(r1.status, 201, JSON.stringify(r1.json));
+  // c2's report merges on shared 'crack'; its PRIMARY 'waterlogging' differs from the issue's.
+  const key = 'mh-' + uniq();
+  const body = reportBody({ lat: la, lon: lo }, { hazard: 'waterlogging', hazards: ['waterlogging', 'crack'] });
+  const r2 = await c2.post('/v1/reports', body, { 'idempotency-key': key });
+  assert.equal(r2.status, 200, JSON.stringify(r2.json));
+  // Byte-identical retry: the ORIGINAL REPORT primary decides, not the issue primary.
+  const retry = await c2.post('/v1/reports', body, { 'idempotency-key': key });
+  assert.equal(retry.status, 200);
+  assert.equal(retry.json.replayed, true);
+  // Same set, promoted primary: new intent, not a replay.
+  const promoted = await c2.post('/v1/reports', reportBody({ lat: la, lon: lo }, { hazard: 'crack', hazards: ['waterlogging', 'crack'] }), { 'idempotency-key': key });
+  assert.equal(promoted.status, 409);
+});
+
+test('hazards_ok rejects 0-based, 2-D and NULL-bearing arrays at the DB level', async () => {
+  const uid = (await w.adminDb.query(`SELECT id FROM users LIMIT 1`)).rows[0].id;
+  const base = `INSERT INTO issues (reporter_id, geom, hazard, hazards, severity) VALUES ($1, ST_SetSRID(ST_MakePoint(76.7,30.7),4326)::geography, 'crack', $2::hazard_type[], 1)`;
+  const bad = async (lit: string, label: string) => {
+    const e = await w.adminDb.query(base, [uid, lit]).then(() => null).catch((x) => x);
+    assert.ok(e, label);
+  };
+  await bad('[0:0]={crack}', '0-based array');
+  await bad('{{crack},{crack}}', '2-D array');
+  await bad('{crack,NULL}', 'NULL element');
+  const nn = await w.adminDb.query(base, [uid, '{crack}']);
+  assert.equal(nn.rowCount, 1, 'plain 1-D 1-based set inserts');
+});
+
 test('no shared hazard nearby: separate issues', async () => {
   const c1 = await mk(); const c2 = await mk();
   const la = P_NOROAD.lat - 0.05, lo = P_NOROAD.lon - 0.05;

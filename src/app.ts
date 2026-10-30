@@ -220,9 +220,8 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
       await c.query('SELECT pg_advisory_xact_lock(4201)');
       if (idem) {
         const ex = await c.query(
-          `SELECT r.issue_id, r.id, ST_Y(r.geom::geometry) AS lat, ST_X(r.geom::geometry) AS lon, i.hazard, r.hazards
-           FROM reports r JOIN issues i ON i.id = r.issue_id
-           WHERE r.user_id=$1 AND r.idempotency_key=$2`, [p.userId, idem]);
+          `SELECT r.issue_id, r.id, ST_Y(r.geom::geometry) AS lat, ST_X(r.geom::geometry) AS lon, r.hazards
+           FROM reports r WHERE r.user_id=$1 AND r.idempotency_key=$2`, [p.userId, idem]);
         if (ex.rowCount) {
           // Replay = return the ORIGINAL result. It must NEVER consume a new upload:
           // under the atomic design there is no crash window between report creation
@@ -232,8 +231,11 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
           // Canonical SET compare: a reordered-but-identical hazard set is the same report
           // (true replay); a changed set is a changed payload (409).
           const canon = (a: string[]) => [...new Set(a)].sort().join(',');
-          if (orig.lat !== b.lat || orig.lon !== b.lon || orig.hazard !== b.hazard
-              || canon(pgEnumArray(orig.hazards)) !== canon(hazardSet))
+          const origSet = pgEnumArray(orig.hazards);
+          // Primary = the ORIGINAL REPORT's first hazard, never the (possibly merged) issue's.
+          // Same primary + reordered extras = true replay; a promoted primary = new intent = 409.
+          if (orig.lat !== b.lat || orig.lon !== b.lon || origSet[0] !== b.hazard
+              || canon(origSet) !== canon(hazardSet))
             throw new HttpError(409, 'This idempotency key was already used with a different report', 'idempotency_mismatch');
           const bound = (await c.query(
             `SELECT s.id AS upload_id, e.id AS evidence_id FROM staged_uploads s

@@ -6,14 +6,18 @@
 
 CREATE OR REPLACE FUNCTION hazards_ok(h hazard_type[]) RETURNS boolean
 LANGUAGE sql IMMUTABLE RETURNS NULL ON NULL INPUT AS $$
-  SELECT cardinality(h) >= 1 AND (SELECT count(DISTINCT u) FROM unnest(h) u) = cardinality(h)
+  -- 1-D 1-based arrays only (a 0-based '[0:0]={crack}' or a 2-D literal is not a hazard set),
+  -- at least one element, no NULLs, no duplicates.
+  SELECT h IS NOT NULL AND array_ndims(h) = 1 AND array_lower(h, 1) = 1
+     AND cardinality(h) >= 1 AND NOT EXISTS (SELECT 1 FROM unnest(h) u WHERE u IS NULL)
+     AND (SELECT count(DISTINCT u) FROM unnest(h) u) = cardinality(h)
 $$;
 
 ALTER TABLE issues ADD COLUMN hazards hazard_type[];
 UPDATE issues SET hazards = ARRAY[hazard];
 ALTER TABLE issues ALTER COLUMN hazards SET NOT NULL;
 ALTER TABLE issues ADD CONSTRAINT issues_hazards_valid CHECK (hazards_ok(hazards));
-ALTER TABLE issues ADD CONSTRAINT issues_hazards_primary CHECK (hazards[1] = hazard);
+ALTER TABLE issues ADD CONSTRAINT issues_hazards_primary CHECK ((hazards[1] = hazard) IS TRUE);
 
 ALTER TABLE reports ADD COLUMN hazards hazard_type[];
 UPDATE reports r SET hazards = ARRAY[i.hazard] FROM issues i WHERE i.id = r.issue_id;
