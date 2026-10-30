@@ -24,11 +24,21 @@ function parse<T>(schema: z.ZodType<T>, v: unknown): T {
   return r.data;
 }
 
-const ISSUE_COLS = `i.review_org_id, i.id, i.complaint_no, i.hazard, i.danger_flag, i.severity, i.status, i.ward, i.responsible_kind, i.route_reason, i.route_flags, i.route_overridden,
+const ISSUE_COLS = `i.review_org_id, i.id, i.complaint_no, i.hazard, i.hazards, i.danger_flag, i.severity, i.status, i.ward, i.responsible_kind, i.route_reason, i.route_flags, i.route_overridden,
   i.deadline_at, i.reports_count, i.reopen_count, i.created_at, i.updated_at, i.fixed_at,
   ST_Y(i.geom::geometry) AS lat, ST_X(i.geom::geometry) AS lon,
   i.is_test, ro.id AS responsible_org_id, ro.name AS responsible_org_name, ro.is_synthetic AS responsible_synthetic, co.name AS copy_org_name, i.copy_org_id`;
 const ISSUE_FROM = `FROM issues i LEFT JOIN orgs ro ON ro.id=i.responsible_org_id LEFT JOIN orgs co ON co.id=i.copy_org_id`;
+
+/** node-pg returns custom enum arrays as raw '{a,b}' text; split into a plain list. */
+export function pgEnumArray(v: unknown): string[] {
+  if (Array.isArray(v)) return v as string[];
+  if (typeof v === 'string' && v.startsWith('{') && v.endsWith('}')) {
+    const inner = v.slice(1, -1);
+    return inner ? inner.split(',') : [];
+  }
+  return [];
+}
 
 /** Public view: no reporter identity, no evidence, coordinates rounded to ~11 m. */
 /** Human-readable complaint reference, e.g. NT-000123. Stable for the life of the issue. */
@@ -42,7 +52,7 @@ async function publicOfficialRecords(db: pg.Pool, r: any) {
 }
 function publicDto(r: any) {
   return {
-    id: r.id, complaint_no: r.complaint_no == null ? null : Number(r.complaint_no), complaint_id: complaintId(r.complaint_no == null ? null : Number(r.complaint_no)), hazard: r.hazard, status: r.status, severity: r.severity, ward: r.ward,
+    id: r.id, complaint_no: r.complaint_no == null ? null : Number(r.complaint_no), complaint_id: complaintId(r.complaint_no == null ? null : Number(r.complaint_no)), hazard: r.hazard, hazards: pgEnumArray(r.hazards), status: r.status, severity: r.severity, ward: r.ward,
     location: { lat: Math.round(r.lat * 1e4) / 1e4, lon: Math.round(r.lon * 1e4) / 1e4 },
     responsible: r.responsible_org_name ? { kind: r.responsible_kind, name: r.responsible_org_name, synthetic_data: !!r.responsible_synthetic } : null,
     deadline_at: r.deadline_at, reports_count: r.reports_count, route_flags: r.route_flags, created_at: r.created_at, updated_at: r.updated_at,
@@ -182,6 +192,9 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
     const p = await auth(req);
     const b = parse(z.object({
       lat, lon, accuracy_m: z.number().min(0).max(100000).optional(), hazard: z.enum(HAZARDS), danger: z.boolean().default(false),
+      // Multi-hazard reports: the full set observed at this spot. `hazard` stays the PRIMARY
+      // (must be included); order of the rest is the reporter's. Old clients omit it => [hazard].
+      hazards: z.array(z.enum(HAZARDS)).min(1).max(HAZARDS.length).optional(),
       note: z.string().trim().max(500).optional(), captured_at: z.string().datetime(),
       // Photo-mandatory reports: id from POST /v1/uploads/stage. Bound atomically in the
       // report transaction below. Optional in the schema for old-client compatibility;
@@ -191,6 +204,9 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
     }).strict(), req.body);
     if (!b.photo_upload_id && cfg.photoRequired)
       throw new HttpError(422, 'A photo is required to file a report. Upload it first (POST /v1/uploads/stage) and pass photo_upload_id.', 'photo_required');
+    if (b.hazards && !b.hazards.includes(b.hazard))
+      throw new HttpError(400, 'hazards must include the primary hazard', 'hazard_set_invalid');
+    const hazardSet = [b.hazard, ...new Set((b.hazards ?? []).filter((h) => h !== b.hazard))];
     const idem = (req.headers['idempotency-key'] as string | undefined)?.slice(0, 128);
     const t = now();
     const captured = new Date(b.captured_at);
@@ -204,16 +220,22 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
       await c.query('SELECT pg_advisory_xact_lock(4201)');
       if (idem) {
         const ex = await c.query(
-          `SELECT r.issue_id, r.id, ST_Y(r.geom::geometry) AS lat, ST_X(r.geom::geometry) AS lon, i.hazard
-           FROM reports r JOIN issues i ON i.id = r.issue_id
-           WHERE r.user_id=$1 AND r.idempotency_key=$2`, [p.userId, idem]);
+          `SELECT r.issue_id, r.id, ST_Y(r.geom::geometry) AS lat, ST_X(r.geom::geometry) AS lon, r.hazards
+           FROM reports r WHERE r.user_id=$1 AND r.idempotency_key=$2`, [p.userId, idem]);
         if (ex.rowCount) {
           // Replay = return the ORIGINAL result. It must NEVER consume a new upload:
           // under the atomic design there is no crash window between report creation
           // and photo binding (one transaction), so a replay carrying a DIFFERENT
           // upload id is a changed payload with a reused key, not a recovery - 409.
           const orig = ex.rows[0];
-          if (orig.lat !== b.lat || orig.lon !== b.lon || orig.hazard !== b.hazard)
+          // Canonical SET compare: a reordered-but-identical hazard set is the same report
+          // (true replay); a changed set is a changed payload (409).
+          const canon = (a: string[]) => [...new Set(a)].sort().join(',');
+          const origSet = pgEnumArray(orig.hazards);
+          // Primary = the ORIGINAL REPORT's first hazard, never the (possibly merged) issue's.
+          // Same primary + reordered extras = true replay; a promoted primary = new intent = 409.
+          if (orig.lat !== b.lat || orig.lon !== b.lon || origSet[0] !== b.hazard
+              || canon(origSet) !== canon(hazardSet))
             throw new HttpError(409, 'This idempotency key was already used with a different report', 'idempotency_mismatch');
           const bound = (await c.query(
             `SELECT s.id AS upload_id, e.id AS evidence_id FROM staged_uploads s
@@ -230,9 +252,9 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
       if (cap.rows[0].n >= cfg.dailyReportCap) throw new HttpError(429, 'Daily report limit reached', 'daily_cap');
 
       const dup = await c.query(
-        `SELECT id FROM issues WHERE hazard=$1 AND status NOT IN ('fixed','rejected') AND is_test=$5
+        `SELECT id FROM issues WHERE hazards && $1::hazard_type[] AND status NOT IN ('fixed','rejected') AND is_test=$5
          AND ST_DWithin(geom, ST_SetSRID(ST_MakePoint($3,$2),4326)::geography, $4)
-         ORDER BY ST_Distance(geom, ST_SetSRID(ST_MakePoint($3,$2),4326)::geography) LIMIT 1 FOR UPDATE`, [b.hazard, b.lat, b.lon, cfg.duplicateRadiusM, isTest]);
+         ORDER BY ST_Distance(geom, ST_SetSRID(ST_MakePoint($3,$2),4326)::geography) LIMIT 1 FOR UPDATE`, [hazardSet, b.lat, b.lon, cfg.duplicateRadiusM, isTest]);
       let issueId: string; let created = false; let merged = false;
       if (dup.rowCount) {
         issueId = dup.rows[0].id;
@@ -240,7 +262,9 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
         const cur = await lockIssue(c, issueId);
         const reports = cur.reports_count + 1;
         const sev = Math.max(cur.severity, severityOf(cur.hazard, cur.danger_flag || b.danger, reports));
-        await c.query('UPDATE issues SET reports_count=$2, severity=$3, danger_flag = danger_flag OR $4, updated_at=now() WHERE id=$1', [issueId, reports, sev, b.danger]);
+        await c.query(`UPDATE issues i SET reports_count=$2, severity=$3, danger_flag = danger_flag OR $4, updated_at=now(),
+          hazards = i.hazards || COALESCE((SELECT array_agg(u ORDER BY ord) FROM unnest($5::hazard_type[]) WITH ORDINALITY AS s(u, ord) WHERE u <> ALL (i.hazards)), '{}')
+          WHERE id=$1`, [issueId, reports, sev, b.danger, hazardSet]);
         if (sev > cur.severity && cur.deadline_at && ['assigned', 'in_progress', 'reopened'].includes(cur.status)) {
           // Higher severity shortens the window from the existing assignment time; an existing deadline is never extended.
           const since = (await c.query(`SELECT max(created_at) t FROM status_events WHERE issue_id=$1 AND to_status IN ('assigned','reopened')`, [issueId])).rows[0].t;
@@ -252,8 +276,8 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
         const sev = severityOf(b.hazard, b.danger, 1);
         const route = await routeIssue(c, cfg, b.lat, b.lon, t, isTest);
         const ins = await c.query(
-          `INSERT INTO issues (reporter_id, geom, hazard, danger_flag, severity, ward, road_id, is_test) VALUES ($1, ST_SetSRID(ST_MakePoint($3,$2),4326)::geography, $4,$5,$6,$7,$8,$9) RETURNING id`,
-          [p.userId, b.lat, b.lon, b.hazard, b.danger, sev, route.ward, route.roadId, isTest]);
+          `INSERT INTO issues (reporter_id, geom, hazard, hazards, danger_flag, severity, ward, road_id, is_test) VALUES ($1, ST_SetSRID(ST_MakePoint($3,$2),4326)::geography, $4,$10,$5,$6,$7,$8,$9) RETURNING id`,
+          [p.userId, b.lat, b.lon, b.hazard, b.danger, sev, route.ward, route.roadId, isTest, hazardSet]);
         issueId = ins.rows[0].id; created = true;
         await recordEvent(c, issueId, p.userId, null, 'reported', 'created');
         if (cfg.verificationMode === 'auto_checks' && route.orgId) {
@@ -271,8 +295,8 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
         }
       }
       const rep = await c.query(
-        `INSERT INTO reports (issue_id, user_id, geom, accuracy_m, note, captured_at, idempotency_key) VALUES ($1,$2,ST_SetSRID(ST_MakePoint($4,$3),4326)::geography,$5,$6,$7,$8) RETURNING id`,
-        [issueId, p.userId, b.lat, b.lon, b.accuracy_m ?? null, b.note ?? null, captured, idem ?? null]);
+        `INSERT INTO reports (issue_id, user_id, geom, accuracy_m, note, captured_at, idempotency_key, hazards) VALUES ($1,$2,ST_SetSRID(ST_MakePoint($4,$3),4326)::geography,$5,$6,$7,$8,$9) RETURNING id`,
+        [issueId, p.userId, b.lat, b.lon, b.accuracy_m ?? null, b.note ?? null, captured, idem ?? null, hazardSet]);
       const stNow = (await c.query('SELECT status FROM issues WHERE id=$1', [issueId])).rows[0].status;
       if (stNow !== 'reported') { // points only for reports on an issue that has been verified (PRD: "verified new report")
         await awardPoints(c, cfg, p.userId, 10, 'verified_report', issueId);
