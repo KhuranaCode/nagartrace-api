@@ -264,9 +264,13 @@ test('regression: unknown attempt survives consent revoke + re-grant, never re-a
   await w.adminDb.query(`UPDATE followup_delivery SET state='unknown', provider_message_id='key:old', first_attempt_at=now()-interval '31 minutes', attempt_count=1 WHERE campaign_id=$1 AND stage_day=7`, [cid]);
   const sender = new FakeSender(async () => ({ outcome: 'accepted', providerMessageId: 'x' }));
   sender.idempotentRetryMinutes = 30;
-  await consent(u.c, false); await consent(u.c, true); // revoke + re-grant around the unknown row
-  const st = (await w.adminDb.query(`SELECT state FROM followup_delivery WHERE campaign_id=$1 AND stage_day=7`, [cid])).rows[0].state;
-  assert.equal(st, 'unknown', 'uncertain provider outcome is preserved independent of consent state');
+  await consent(u.c, false); // revoke: endpoint preserves unknown
+  assert.equal((await w.adminDb.query(`SELECT state FROM followup_delivery WHERE campaign_id=$1 AND stage_day=7`, [cid])).rows[0].state, 'unknown');
+  const np = await sweepFollowups(w.runtime, new NoProvider()); // sweep WHILE revoked: must not rewrite unknown
+  assert.equal((np.states.blocked_no_consent ?? 0), 0, 'consent gate must not rewrite an unknown row');
+  assert.equal((await w.adminDb.query(`SELECT state FROM followup_delivery WHERE campaign_id=$1 AND stage_day=7`, [cid])).rows[0].state, 'unknown', 'uncertain provider outcome is preserved independent of consent state');
+  await consent(u.c, true); // re-grant: must NOT re-arm unknown as fresh pending
+  assert.equal((await w.adminDb.query(`SELECT state FROM followup_delivery WHERE campaign_id=$1 AND stage_day=7`, [cid])).rows[0].state, 'unknown');
   await sweepFollowups(w.runtime, sender);
   assert.equal(sender.calls.length, 0, '31-min-old key: attempt is outside the original TTL: never resent');
   assert.equal((await w.adminDb.query(`SELECT state FROM followup_delivery WHERE campaign_id=$1 AND stage_day=7`, [cid])).rows[0].state, 'unknown');

@@ -139,6 +139,10 @@ export async function sweepFollowups(db: pg.Pool, sender: Sender, maxAttempts = 
         if (n === 0) bump('stopped_concurrently'); else bump(state);
         return n > 0;
       };
+      // Gate failures on a previously-'unknown' row must NOT erase that truth (uncertain
+      // provider outcome). Only a reconcile/send path may move it; gates just leave it.
+      const stop = (state: string, opts: { extra?: string; params?: any[] } = {}) =>
+        r.prior_state === 'unknown' ? fin('unknown', { touch: false }) : fin(state, opts);
       const camp = (await cx.query(
         `SELECT c.state, c.issue_id, c.owner_user_id, c.recipient_address, c.recipient_verified, c.stages,
                 (SELECT i.status FROM issues i WHERE i.id=c.issue_id) AS issue_status
@@ -147,8 +151,7 @@ export async function sweepFollowups(db: pg.Pool, sender: Sender, maxAttempts = 
       if (!camp || camp.state !== 'active' || camp.issue_status === 'fixed' || camp.issue_status === 'rejected') {
         // An 'unknown' row records a real attempt with an uncertain outcome: never erase that
         // truth just because the campaign stopped. It stays manual-reconciliation only.
-        if (r.prior_state === 'unknown') await fin('unknown', { touch: false });
-        else await fin('suppressed');
+        await stop('suppressed');
         if (camp && camp.state === 'active')
           await cx.query(`UPDATE followup_campaign SET state='stopped_resolved' WHERE id=$1 AND state='active'`, [r.campaign_id]);
         await cx.query('COMMIT'); continue;
@@ -159,12 +162,12 @@ export async function sweepFollowups(db: pg.Pool, sender: Sender, maxAttempts = 
         `SELECT granted, scope_version FROM user_mail_consent WHERE user_id=$1 AND kind='report_reminders' FOR UPDATE`,
         [camp.owner_user_id])).rows[0];
       if (!consent?.granted || consent.scope_version !== FOLLOWUP_CONSENT_VERSION) {
-        await fin('blocked_no_consent', { extra: `, last_error=$3`, params: [consent?.granted ? 'consent_version_changed' : 'consent_not_granted'] });
+        await stop('blocked_no_consent', { extra: `, last_error=$3`, params: [consent?.granted ? 'consent_version_changed' : 'consent_not_granted'] });
         await cx.query('COMMIT'); continue;
       }
       // 3. Verified recipient with a concrete address?
       if (!camp.recipient_verified || !camp.recipient_address) {
-        await fin('blocked_no_recipient');
+        await stop('blocked_no_recipient');
         await cx.query('COMMIT'); continue;
       }
       // 4. Unknown previous attempt: reconcile first, NEVER blind resend. A 'key:' attempt may only
@@ -185,12 +188,12 @@ export async function sweepFollowups(db: pg.Pool, sender: Sender, maxAttempts = 
       }
       // 5. Attempt cap - persisted, not just reported.
       if (r.attempt_count >= maxAttempts) {
-        await fin('failed', { extra: `, last_error=$3`, params: ['attempt_cap_reached'] });
+        await stop('failed', { extra: `, last_error=$3`, params: ['attempt_cap_reached'] });
         await cx.query('COMMIT'); continue;
       }
       // 6. Provider gate: NoProvider leaves the honest blocked state.
       if (sender.name === 'none') {
-        await fin('blocked_no_provider');
+        await stop('blocked_no_provider');
         await cx.query('COMMIT'); continue;
       }
       // 7. Immutable payload: rendered once ({{status}} substituted), persisted, reused on retry.
