@@ -119,8 +119,8 @@ test('photo-mandatory reports: stage + atomic bind, guards and failure modes', a
       const spot = { lat: P_NOROAD.lat + 0.06, lon: P_NOROAD.lon };
       const uploadId = await stageFor(a, spot);
       const [r1, r2] = await Promise.all([
-        a.post('/v1/reports', reportBody(spot, { photo_upload_id: uploadId, hazard: 'debris' })),
-        b.post('/v1/reports', reportBody(spot, { photo_upload_id: uploadId, hazard: 'debris' })),
+        a.post('/v1/reports', reportBody(spot, { photo_upload_id: uploadId, hazard: 'other' })),
+        b.post('/v1/reports', reportBody(spot, { photo_upload_id: uploadId, hazard: 'other' })),
       ]);
       const ok = [r1, r2].filter((r) => r.status === 201 || r.status === 200);
       const bad = [r1, r2].filter((r) => r.status === 422);
@@ -174,11 +174,11 @@ test('photo-mandatory reports: stage + atomic bind, guards and failure modes', a
       const b = await fresh(wOn);
       const spotA = { lat: P_NOROAD.lat + 0.09, lon: P_NOROAD.lon };
       const up1 = await stageFor(a, spotA);
-      const r1 = await a.post('/v1/reports', reportBody(spotA, { photo_upload_id: up1, hazard: 'flooding' }));
+      const r1 = await a.post('/v1/reports', reportBody(spotA, { photo_upload_id: up1, hazard: 'waterlogging' }));
       assert.equal(r1.status, 201);
       const spotB = { lat: spotA.lat + 0.0001, lon: spotA.lon }; // ~11 m away -> merges
       const up2 = await stageFor(b, spotB);
-      const r2 = await b.post('/v1/reports', reportBody(spotB, { photo_upload_id: up2, hazard: 'flooding' }));
+      const r2 = await b.post('/v1/reports', reportBody(spotB, { photo_upload_id: up2, hazard: 'waterlogging' }));
       assert.equal(r2.status, 200);
       assert.equal(r2.json.merged_into_existing, true);
       assert.equal(r2.json.issue.id, r1.json.issue.id);
