@@ -321,10 +321,6 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
   // ---------- staged uploads (photo-mandatory reports) ----------
   app.post('/v1/uploads/stage', async (req, reply) => {
     const p = await auth(req);
-    // Citizen-only: staff accounts (any org membership) use staff flows and never
-    // stage citizen report photos. Mirrors the points/streaks accountability split.
-    if ((await memberships(db, p.userId)).length > 0)
-      throw new HttpError(403, 'Only citizen accounts can stage report photos', 'not_eligible');
     // Query strings are strings - coerce like the evidence endpoint does (a shared
     // z.number() here rejected every call with 400; caught by peer's live run).
     const q = parse(z.object({ lat: z.coerce.number().min(-90).max(90), lon: z.coerce.number().min(-180).max(180) }), req.query);
@@ -354,14 +350,26 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
         // concurrent stages cannot both pass a count taken before either inserts.
         await c.query('SELECT pg_advisory_xact_lock(hashtext($1))', ['stage:' + p.userId]);
         // Lazy expiry sweep, bounded to 100 rows per pass. ONLY unconsumed rows are
-        // eligible - a consumed row's blob is live issue evidence. The blob is deleted
-        // BEFORE the row: if the store delete fails the row is KEPT and retried on a
-        // later pass, so blobs are not orphaned by a flaky store. Backstop for a
-        // permanently failing store remains bucket lifecycle policy (documented gap).
-        const expired = await c.query('SELECT id, storage_key FROM staged_uploads WHERE consumed_at IS NULL AND expires_at < now() LIMIT 100');
+        // eligible - a consumed row's blob is live issue evidence. Rows are locked
+        // FOR UPDATE SKIP LOCKED BEFORE any blob delete: a row a concurrent report is
+        // consuming right now is either locked (skipped this pass) or already consumed
+        // (filtered) - without the lock the old sequence (plain SELECT -> blob delete
+        // -> conditional row DELETE) could delete the blob of a row that a racing
+        // report consumed in between, leaving live evidence pointing at a missing
+        // blob. A binder that arrives while we hold the lock blocks until commit and
+        // then finds the row gone: 422 invalid_upload, correct for an expired upload.
+        // The blob is deleted BEFORE the row: if the store delete fails the row is
+        // KEPT and retried on a later pass, so blobs are not orphaned by a flaky
+        // store. Backstop for a permanently failing store remains bucket lifecycle
+        // policy (documented gap).
+        const expired = await c.query(
+          `SELECT id, storage_key FROM staged_uploads
+           WHERE consumed_at IS NULL AND expires_at < now()
+           ORDER BY expires_at LIMIT 100
+           FOR UPDATE SKIP LOCKED`);
         for (const r of expired.rows) {
           try { await store.del?.(r.storage_key); } catch { continue; }
-          await c.query('DELETE FROM staged_uploads WHERE id=$1 AND consumed_at IS NULL', [r.id]);
+          await c.query('DELETE FROM staged_uploads WHERE id=$1', [r.id]);
         }
         // Per-user staging limits, inside the advisory lock: at most 5 unbound uploads
         // waiting and 30 stages per hour per account, so staging alone cannot fill storage.
