@@ -1,0 +1,4 @@
+code,name,ward,coordinates
+EX-W12-001,"Example Marg, Sector 12",W-12,77.0266 28.4595;77.0290 28.4601;77.0315 28.4610
+EX-W12-002,"Example Link Road",W-12,77.0290 28.4601;77.0302 28.4625
+EX-W07-003,"Example Cross Street, Block C",W-07,77.0411 28.4488;77.0430 28.4496;77.0449 28.4502
