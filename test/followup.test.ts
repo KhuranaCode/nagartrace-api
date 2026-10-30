@@ -85,7 +85,8 @@ test('issuer self-lookup: confirmed email binds; unconfirmed/error stays honestl
   const w2 = await newWorld({ followupPipeline: true, supabaseAnonKey: 'anon-public-test' }, undefined, undefined, { fetchImpl });
   try {
     await w2.adminDb.query(fs.readFileSync(path.resolve(import.meta.dirname, '../db-pending/011_followup_pipeline.sql'), 'utf8'));
-    const t = await sign('u-' + uniq()); // no email claims at all: stock Supabase shape
+    const sub1 = 'u-' + uniq(); const t = await sign(sub1); // no email claims at all: stock Supabase shape
+    responder.body = { id: sub1, email: 'self@example.in', email_confirmed_at: '2026-01-01T00:00:00Z' };
     const c = client(w2, t);
     await consent(c);
     const issueId = await mkIssue(c);
@@ -101,8 +102,8 @@ test('issuer self-lookup: confirmed email binds; unconfirmed/error stays honestl
     assert.equal(g.json.campaigns[0].recipient_verified, true);
 
     // Unconfirmed address (email_confirmed_at null): no binding, honest 400.
-    responder.body = { email: 'self@example.in', email_confirmed_at: null };
-    const t2 = await sign('u-' + uniq()); const c2 = client(w2, t2);
+    const sub2 = 'u-' + uniq(); const t2 = await sign(sub2); const c2 = client(w2, t2);
+    responder.body = { id: sub2, email: 'self@example.in', email_confirmed_at: null };
     await consent(c2);
     const i2 = await mkIssue(c2);
     assert.equal((await create(c2, i2, 'k-' + uniq(), 'self@example.in')).status, 400);
@@ -123,7 +124,7 @@ test('issuer self-lookup: confirmed email binds; unconfirmed/error stays honestl
     } finally { await w3.close(); }
 
     // Confirmed via lookup but body email disagrees: 403 recipient_mismatch, never stored.
-    responder.status = 200; responder.body = { email: 'self@example.in', email_confirmed_at: '2026-01-01T00:00:00Z' };
+    responder.status = 200; responder.body = { id: sub2, email: 'self@example.in', email_confirmed_at: '2026-01-01T00:00:00Z' };
     const i4 = await mkIssue(c2);
     assert.equal((await create(c2, i4, 'k-' + uniq(), 'someone-else@example.in')).status, 403);
 
@@ -136,6 +137,75 @@ test('issuer self-lookup: confirmed email binds; unconfirmed/error stays honestl
     assert.equal((await create(c5, i5, 'k-' + uniq(), 'claim@example.in')).status, 201);
     assert.equal(calls.length, 0);
   } finally { await w2.close(); }
+});
+
+
+test('issuer self-lookup hardening: wrong id, bad email, bad/future confirmation all reject', async () => {
+  let body: any = null; let status = 200; let initSeen: any = null;
+  const fetchImpl = (async (_url: any, init: any) => {
+    initSeen = init;
+    return { status, json: async () => body } as any;
+  }) as any;
+  const w2 = await newWorld({ followupPipeline: true, supabaseAnonKey: 'anon-public-test' }, undefined, undefined, { fetchImpl });
+  try {
+    await w2.adminDb.query(fs.readFileSync(path.resolve(import.meta.dirname, '../db-pending/011_followup_pipeline.sql'), 'utf8'));
+    const sub = 'u-' + uniq();
+    const c = client(w2, await sign(sub));
+    await consent(c);
+    const good = { id: sub, email: 'ok@example.in', email_confirmed_at: '2026-01-01T00:00:00Z' };
+    const expect400 = async (b: any, label: string) => {
+      body = b; status = 200;
+      const i = await mkIssue(c);
+      const r = await create(c, i, 'k-' + uniq(), 'ok@example.in');
+      assert.equal(r.status, 400, label + ': ' + JSON.stringify(r.json));
+    };
+    await expect400({ ...good, id: 'u-someone-else' }, 'echoed id of a DIFFERENT user must never bind');
+    await expect400({ ...good, id: 12345 }, 'non-string id');
+    await expect400({ ...good, email: 'not-an-email' }, 'malformed email');
+    await expect400({ ...good, email: 'a@b' }, 'domain-less email');
+    await expect400({ ...good, email_confirmed_at: 'tomorrow-not-a-date' }, 'unparseable confirmation');
+    await expect400({ ...good, email_confirmed_at: '2099-01-01T00:00:00Z' }, 'future confirmation');
+    await expect400({ ...good, email_confirmed_at: true }, 'boolean confirmation');
+    await expect400({ ...good, email_confirmed_at: 1735689600 }, 'numeric confirmation');
+    // A well-formed response binds, and the transport options are pinned.
+    body = good; status = 200;
+    const i = await mkIssue(c);
+    assert.equal((await create(c, i, 'k-' + uniq(), 'ok@example.in')).status, 201);
+    assert.equal(initSeen.redirect, 'error', 'redirects are never followed');
+    assert.ok(initSeen.signal instanceof AbortSignal, 'an abort signal governs the fetch');
+    // A redirect RESPONSE is never treated as success either.
+    status = 302;
+    const i2 = await mkIssue(c);
+    assert.equal((await create(c, i2, 'k-' + uniq(), 'ok@example.in')).status, 400);
+  } finally { await w2.close(); }
+});
+
+test('issuer self-lookup over an http issuer is refused BEFORE any fetch (bearer never sent plaintext)', async () => {
+  let calls = 0;
+  const spy = (async () => { calls++; throw new Error('must not be called'); }) as any;
+  const w5 = await newWorld({ followupPipeline: true, supabaseAnonKey: 'anon-public-test', authIssuer: 'http://issuer.test/' }, undefined, undefined, { fetchImpl: spy });
+  try {
+    await w5.adminDb.query(fs.readFileSync(path.resolve(import.meta.dirname, '../db-pending/011_followup_pipeline.sql'), 'utf8'));
+    const c = client(w5, await sign('u-' + uniq(), { iss: 'http://issuer.test/' }));
+    await consent(c);
+    const i = await mkIssue(c);
+    assert.equal((await create(c, i, 'k-' + uniq(), 'x@example.in')).status, 400);
+    assert.equal(calls, 0);
+  } finally { await w5.close(); }
+});
+
+test('issuer self-lookup: a stalled body can never hang the request (abort-bounded)', async () => {
+  const stall = (async () => ({ status: 200, json: () => new Promise(() => {}) })) as any;
+  const w6 = await newWorld({ followupPipeline: true, supabaseAnonKey: 'anon-public-test' }, undefined, undefined, { fetchImpl: stall });
+  try {
+    await w6.adminDb.query(fs.readFileSync(path.resolve(import.meta.dirname, '../db-pending/011_followup_pipeline.sql'), 'utf8'));
+    const c = client(w6, await sign('u-' + uniq()));
+    await consent(c);
+    const i = await mkIssue(c);
+    const t0 = Date.now();
+    assert.equal((await create(c, i, 'k-' + uniq(), 'x@example.in')).status, 400);
+    assert.ok(Date.now() - t0 < 9000, 'the 5s abort bounded the stalled body');
+  } finally { await w6.close(); }
 });
 
 test('issuer self-lookup disabled without an anon key: no lookup attempted', async () => {

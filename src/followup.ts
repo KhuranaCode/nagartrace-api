@@ -62,25 +62,45 @@ import type { Config } from './config.ts';
  * Least-privilege verified-email binding (peer-settled direction; service-role route rejected).
  * Asks the ISSUER, with the requester's OWN bearer token, whether the sign-in address is
  * confirmed: GET {cfg.authIssuer}/user (Supabase GoTrue) with the public anon key as apikey.
- * The URL comes from CONFIG (authIssuer is what the token's signature was verified against),
- * never from request data. An address binds ONLY on HTTP 200 + string email + non-null
- * email_confirmed_at - the issuer's own confirmation marker. Any failure (non-200, timeout,
- * malformed body, unconfirmed) yields null and the caller keeps the honest unavailable state.
- * The result is used for THIS request only; it is never persisted as a verified address.
+ *
+ * Transport + response hardening (adversarially reviewed):
+ *  - The URL is parsed from CONFIG ONLY (authIssuer is what the token signature was verified
+ *    against) and must be exact: https:, no userinfo, no query, no fragment. An http issuer
+ *    would put the bearer on the wire in plaintext, so the lookup is refused BEFORE any fetch.
+ *  - redirect: 'error' - a redirect is never followed, so the bearer can never leak cross-origin.
+ *  - One AbortSignal.timeout(5000) governs connect AND body: the json() read is raced against
+ *    the same signal's abort event, so a stalled body can never hang the request.
+ *  - Response binds ONLY when ALL hold: HTTP 200; id === the VERIFIED JWT sub of THIS request
+ *    (a confused/token-swapped response can never bind another user's address); email is a
+ *    string matching a conservative address shape; email_confirmed_at is a STRING that parses
+ *    as a timestamp and is not in the future (the issuer's own confirmation marker).
+ *  - user_metadata is USER-EDITABLE and is never consulted. Nothing (token, response, address)
+ *    is persisted or logged; the result serves THIS request only.
+ * Any failure yields null and the caller keeps the honest signin_email_unavailable state.
  */
-export async function resolveVerifiedEmail(cfg: Config, authHeader: string | undefined, fetchImpl: typeof fetch): Promise<string | null> {
+export async function resolveVerifiedEmail(cfg: Config, authHeader: string | undefined, expectedSub: string, fetchImpl: typeof fetch): Promise<string | null> {
   if (!cfg.supabaseAnonKey || !authHeader) return null;
-  const base = cfg.authIssuer.replace(/\/+$/, ''); // e.g. https://<ref>.supabase.co/auth/v1
+  let url: URL;
+  try { url = new URL(cfg.authIssuer.replace(/\/+$/, '') + '/user'); } catch { return null; }
+  if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash) return null;
+  const signal = AbortSignal.timeout(5000);
   try {
-    const r = await fetchImpl(`${base}/user`, {
+    const r = await fetchImpl(url, {
       headers: { apikey: cfg.supabaseAnonKey, authorization: authHeader },
-      signal: AbortSignal.timeout(5000),
+      redirect: 'error',
+      signal,
     });
     if (r.status !== 200) return null;
-    const j: any = await r.json();
-    if (typeof j?.email === 'string' && j.email.length > 0 && j.email.length <= 320
-        && typeof j?.email_confirmed_at === 'string' && j.email_confirmed_at.length > 0) return j.email;
-    return null;
+    const j: any = await Promise.race([
+      r.json(),
+      new Promise((_, rej) => signal.addEventListener('abort', () => rej(signal.reason), { once: true })),
+    ]);
+    if (typeof j?.id !== 'string' || j.id !== expectedSub) return null;
+    if (typeof j?.email !== 'string' || j.email.length > 320 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(j.email)) return null;
+    if (typeof j?.email_confirmed_at !== 'string') return null;
+    const confirmed = Date.parse(j.email_confirmed_at);
+    if (!Number.isFinite(confirmed) || confirmed > Date.now()) return null;
+    return j.email;
   } catch { return null; }
 }
 
@@ -327,7 +347,7 @@ export function registerFollowupRoutes(app: FastifyInstance, deps: { cfg: Config
     let recipientVerified = false;
     if (audience === 'reporter') {
       if (recipient_descriptor !== 'self') throw new HttpError(400, 'reporter campaigns are self-addressed', 'bad_audience');
-      const bound = p.email ?? await resolveVerifiedEmail(cfg, req.headers.authorization, fetchImpl);
+      const bound = p.email ?? await resolveVerifiedEmail(cfg, req.headers.authorization, p.subject, fetchImpl);
       if (!bound) throw new HttpError(400, 'your sign-in address is not available from this session', 'signin_email_unavailable');
       if (typeof recipient_email !== 'string' || recipient_email.toLowerCase() !== bound.toLowerCase())
         throw new HttpError(403, 'recipient_email must be your own sign-in address', 'recipient_mismatch');
