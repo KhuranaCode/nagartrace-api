@@ -127,10 +127,31 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
    * unconsumed so the client can retry with corrected GPS.
    */
   async function bindStagedPhoto(c: pg.PoolClient, userId: string, issueId: string, uploadId: string) {
-    const su = await c.query('SELECT * FROM staged_uploads WHERE id=$1 FOR UPDATE', [uploadId]);
-    const s = su.rows[0];
-    if (!s || s.uploader_id !== userId || s.consumed_at || new Date(s.expires_at) < new Date())
+    // Atomic claim: one conditional UPDATE decides consumption. Two concurrent reports
+    // carrying the same upload id cannot both pass - the loser's UPDATE matches no row.
+    const claim = await c.query(
+      `UPDATE staged_uploads SET consumed_at=now(), issue_id=$2
+       WHERE id=$1 AND uploader_id=$3 AND consumed_at IS NULL AND expires_at > now()
+       RETURNING *`, [uploadId, issueId, userId]);
+    let s = claim.rows[0];
+    if (!s) {
+      // Claim failed. The ONLY distinguished case is an idempotent replay of a report
+      // that already bound this upload to THIS issue (e.g. the client retried after a
+      // crash): return the existing evidence instead of an error. Unknown id, another
+      // user's upload, expiry and consumption by a different issue all get the same
+      // 422 - the error must not reveal whether someone else's upload id exists.
+      const ex = await c.query('SELECT issue_id, storage_key FROM staged_uploads WHERE id=$1 AND uploader_id=$2 AND consumed_at IS NOT NULL', [uploadId, userId]);
+      if (ex.rowCount && ex.rows[0].issue_id === issueId) {
+        const ev = await c.query('SELECT id FROM evidence WHERE issue_id=$1 AND storage_key=$2', [issueId, ex.rows[0].storage_key]);
+        if (ev.rowCount) return { evidence_id: ev.rows[0].id as string, location_ok: true };
+      }
       throw new HttpError(422, 'Photo upload is invalid, expired or already used - stage a fresh photo.', 'invalid_upload');
+    }
+    // Location: the photo's claimed point is checked against the ISSUE's actual
+    // location (not a centroid), matching the evidence endpoint's rule. On a merged
+    // report that is the existing issue's geom. A mismatch throws, which rolls the
+    // whole report back - the claim above is undone with it, so the upload stays
+    // consumable for a retry at the true location.
     const near = (await c.query(
       `SELECT ST_DWithin(i.geom, s.claimed_geom, $3) AS ok FROM issues i, staged_uploads s WHERE i.id=$1 AND s.id=$2`, [issueId, uploadId, cfg.evidenceRadiusM])).rows[0].ok;
     if (!near) throw new HttpError(422, `Photo location must be within ${cfg.evidenceRadiusM} m of the report`, 'location_mismatch');
@@ -138,7 +159,6 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
       `INSERT INTO evidence (issue_id, uploader_id, kind, storage_key, sha256, content_type, byte_size, width, height, claimed_geom, location_ok)
        VALUES ($1,$2,'report',$3,$4,$5,$6,$7,$8,$9,true) RETURNING id`,
       [issueId, userId, s.storage_key, s.sha256, s.content_type, s.byte_size, s.width, s.height, s.claimed_geom]);
-    await c.query('UPDATE staged_uploads SET consumed_at=now(), issue_id=$2 WHERE id=$1', [uploadId, issueId]);
     return { evidence_id: ev.rows[0].id as string, location_ok: true };
   }
 
@@ -297,16 +317,41 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
     const p = await auth(req);
     const q = parse(z.object({ lat, lon }), req.query);
     if (!Buffer.isBuffer(req.body)) throw new HttpError(415, 'Send the image as the raw request body (image/jpeg, image/png or image/webp)', 'bad_image');
-    // Lazy sweep of expired, unconsumed staged uploads (bounded; blob delete best-effort).
-    const dead = await db.query(`DELETE FROM staged_uploads WHERE consumed_at IS NULL AND expires_at < now() RETURNING storage_key`);
+    // Lazy sweep of expired staged uploads, bounded to 100 rows per pass. ONLY
+    // unconsumed rows are deleted - a consumed row's blob is live issue evidence and
+    // must never be swept. Blob delete is best-effort: if it fails the row is still
+    // gone and the orphan blob leaks until bucket lifecycle policy (documented leak).
+    const dead = await db.query(
+      `DELETE FROM staged_uploads WHERE id IN (
+         SELECT id FROM staged_uploads WHERE consumed_at IS NULL AND expires_at < now() LIMIT 100
+       ) RETURNING storage_key`);
     for (const r of dead.rows) { try { await store.del?.(r.storage_key); } catch { /* row is gone; an orphan blob is acceptable */ } }
+    // Per-user staging limits, so staging alone cannot fill storage: at most 5
+    // unbound uploads waiting and 30 stages per hour per account.
+    const load = (await db.query(
+      `SELECT count(*) FILTER (WHERE consumed_at IS NULL AND expires_at > now())::int AS pending,
+              count(*) FILTER (WHERE created_at > now() - interval '1 hour')::int AS recent
+       FROM staged_uploads WHERE uploader_id=$1`, [p.userId])).rows[0];
+    if (load.pending >= 5) throw new HttpError(429, 'You have several staged photos waiting. Submit a report with one, or wait for them to expire (1 hour).', 'too_many_staged');
+    if (load.recent >= 30) throw new HttpError(429, 'Too many photo uploads - try again later.', 'rate_limited');
+    // normalizeImage: 8 MB cap, magic-byte sniffing, bounded pixel decode (24 MP),
+    // EXIF orientation applied, then everything re-encoded to fresh JPEG - EXIF (incl.
+    // any embedded GPS) is stripped and never read. claimed_geom below is the client's
+    // own GPS claim from the query string, NOT photo metadata, and it is verified
+    // against the issue location at binding time. Photo metadata is never proof.
     const img = await normalizeImage(req.body);
     const key = await store.put(img.data);
-    const r = await db.query(
-      `INSERT INTO staged_uploads (uploader_id, storage_key, sha256, content_type, byte_size, width, height, claimed_geom)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,ST_SetSRID(ST_MakePoint($9,$8),4326)::geography) RETURNING id, expires_at`,
-      [p.userId, key, img.sha256, img.contentType, img.data.length, img.width, img.height, q.lat, q.lon]);
-    return reply.status(201).send({ upload_id: r.rows[0].id, expires_at: r.rows[0].expires_at, note: 'Private staged photo. It becomes issue evidence only when a report binds it; unbound uploads expire after one hour.' });
+    try {
+      const r = await db.query(
+        `INSERT INTO staged_uploads (uploader_id, storage_key, sha256, content_type, byte_size, width, height, claimed_geom)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,ST_SetSRID(ST_MakePoint($9,$8),4326)::geography) RETURNING id, expires_at`,
+        [p.userId, key, img.sha256, img.contentType, img.data.length, img.width, img.height, q.lat, q.lon]);
+      return reply.status(201).send({ upload_id: r.rows[0].id, expires_at: r.rows[0].expires_at, note: 'Private staged photo. It becomes issue evidence only when a report binds it; unbound uploads expire after one hour.' });
+    } catch (e) {
+      // Row insert failed after the blob write - remove the blob instead of leaking it.
+      try { await store.del?.(key); } catch { /* best-effort; orphan blob leaks until bucket lifecycle */ }
+      throw e;
+    }
   });
 
   // ---------- evidence ----------

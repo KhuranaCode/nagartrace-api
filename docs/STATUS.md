@@ -2,7 +2,7 @@
 
 Backend built from the NagarTrace product requirements (v1.0). Not production-ready. Policy values the requirements leave open are provisional config.
 
-Photo-mandatory reports (migration 008): `POST /uploads/stage` holds a re-encoded photo privately for 1 h; `POST /reports` binds it atomically via `photo_upload_id`. `PHOTO_REQUIRED` env flag (default off) makes the photo mandatory once clients all stage photos; flip it on after the web client ships staging. See docs/API.md.
+Photo-mandatory reports (migration 008): `POST /uploads/stage` holds a re-encoded photo privately for 1 h; `POST /reports` binds it atomically via `photo_upload_id`. `PHOTO_REQUIRED` env flag (default off) makes the photo mandatory once clients all stage photos. The flag is read at process start, so flipping it means an env change plus a Render redeploy/restart - it is NOT in effect until a redeploy with `PHOTO_REQUIRED=true` has completed and a photo-less report has been observed returning 422 `photo_required`. Until that verification, photo-mandatory is not live and must not be claimed as such. See docs/API.md.
 
 ## What exists and is tested (52 tests (api + hardening + findings + contract), real PostgreSQL 14 + PostGIS 3.2, API connects as a restricted DB role)
 - Token verification: issuer, audience, expiry, signature, algorithm allowlist. Identity = (issuer, subject). Roles come only from the database. Self-grant attempts (token claims, profile fields, admin endpoints) tested.
