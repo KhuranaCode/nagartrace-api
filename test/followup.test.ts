@@ -146,7 +146,7 @@ test('issuer self-lookup hardening: wrong id, bad email, bad/future confirmation
     initSeen = init;
     return { status, json: async () => body } as any;
   }) as any;
-  const w2 = await newWorld({ followupPipeline: true, supabaseAnonKey: 'anon-public-test' }, undefined, undefined, { fetchImpl });
+  const w2 = await newWorld({ followupPipeline: true, supabaseAnonKey: 'anon-public-test', dailyReportCap: 100000 }, undefined, undefined, { fetchImpl });
   try {
     await w2.adminDb.query(fs.readFileSync(path.resolve(import.meta.dirname, '../db-pending/011_followup_pipeline.sql'), 'utf8'));
     const sub = 'u-' + uniq();
@@ -167,6 +167,14 @@ test('issuer self-lookup hardening: wrong id, bad email, bad/future confirmation
     await expect400({ ...good, email_confirmed_at: '2099-01-01T00:00:00Z' }, 'future confirmation');
     await expect400({ ...good, email_confirmed_at: true }, 'boolean confirmation');
     await expect400({ ...good, email_confirmed_at: 1735689600 }, 'numeric confirmation');
+    await expect400({ ...good, email_confirmed_at: '1' }, 'bare numeric string is not RFC3339');
+    await expect400({ ...good, email_confirmed_at: '2026-01-01' }, 'date-only is not a confirmation instant');
+    await expect400({ ...good, email_confirmed_at: '2026-02-30T00:00:00Z' }, 'impossible day must not normalize');
+    await expect400({ ...good, email_confirmed_at: '2025-02-29T00:00:00Z' }, 'non-leap Feb 29');
+    await expect400({ ...good, email_confirmed_at: '2026-13-01T00:00:00Z' }, 'month 13');
+    await expect400({ ...good, email_confirmed_at: '2026-01-01T25:00:00Z' }, 'hour 25');
+    await expect400({ ...good, email_confirmed_at: '2026-01-01T00:00:00+99:00' }, 'offset hour 99');
+    await expect400({ ...good, email_confirmed_at: '2026-01-01T00:00:00' }, 'missing offset');
     // A well-formed response binds, and the transport options are pinned.
     body = good; status = 200;
     const i = await mkIssue(c);

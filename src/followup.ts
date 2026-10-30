@@ -97,11 +97,31 @@ export async function resolveVerifiedEmail(cfg: Config, authHeader: string | und
     ]);
     if (typeof j?.id !== 'string' || j.id !== expectedSub) return null;
     if (typeof j?.email !== 'string' || j.email.length > 320 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(j.email)) return null;
-    if (typeof j?.email_confirmed_at !== 'string') return null;
-    const confirmed = Date.parse(j.email_confirmed_at);
-    if (!Number.isFinite(confirmed) || confirmed > Date.now()) return null;
+    if (typeof j?.email_confirmed_at !== 'string' || !rfc3339Strict(j.email_confirmed_at)) return null;
+    if (Date.parse(j.email_confirmed_at) > Date.now()) return null;
     return j.email;
   } catch { return null; }
+}
+
+
+/** Strict RFC3339 timestamp: full date-time with offset, real calendar values only.
+ *  Date.parse alone normalizes impossible dates (2026-02-30 -> Mar 2) and accepts
+ *  date-only/numeric strings - neither proves an issuer confirmation instant. */
+export function rfc3339Strict(s: string): boolean {
+  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(\.\d+)?(Z|[+-]\d{2}:\d{2})$/.exec(s);
+  if (!m) return false;
+  const [, Y, Mo, D, H, Mi, S, , off] = m;
+  const y = +Y, mo = +Mo, d = +D, h = +H, mi = +Mi, se = +S;
+  if (mo < 1 || mo > 12 || h > 23 || mi > 59 || se > 59) return false;
+  const leap = (y % 4 === 0 && y % 100 !== 0) || y % 400 === 0;
+  const dim = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][mo - 1];
+  if (d < 1 || d > dim) return false;
+  if (off !== 'Z') {
+    const oh = +off.slice(1, 3), om = +off.slice(4, 6);
+    if (oh > 23 || om > 59) return false;
+  }
+  const t = Date.parse(s);
+  return Number.isFinite(t);
 }
 
 const DAY_STAGES = [7, 10, 15, 30] as const;
