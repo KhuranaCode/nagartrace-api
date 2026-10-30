@@ -7,6 +7,8 @@ import crypto from 'node:crypto';
 export interface BlobStore {
   put(data: Buffer): Promise<string>;
   get(key: string): Promise<Buffer>;
+  /** Best-effort delete (staged-upload expiry sweep). Optional: stores without it just leak the orphan blob. */
+  del?(key: string): Promise<void>;
 }
 
 export function localStore(dir: string): BlobStore {
@@ -23,6 +25,7 @@ export function localStore(dir: string): BlobStore {
       return key;
     },
     async get(key) { return fs.readFile(file(key)); },
+    async del(key) { await fs.rm(file(key), { force: true }); },
   };
 }
 
@@ -66,6 +69,12 @@ export function s3Store(o: S3Opts): BlobStore {
       const r = await f(s.url, { method: 'GET', headers: s.headers });
       if (!r.ok) throw new Error(`blob get failed: ${r.status}`);
       return Buffer.from(await r.arrayBuffer());
+    },
+    async del(key) {
+      okKey(key);
+      const s = sign('DELETE', key, Buffer.alloc(0));
+      const r = await f(s.url, { method: 'DELETE', headers: s.headers });
+      if (!r.ok && r.status !== 404) throw new Error(`blob delete failed: ${r.status}`);
     },
   };
 }

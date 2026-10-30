@@ -119,12 +119,42 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
   });
 
   // ---------- reporting ----------
+  /**
+   * Binds a staged photo to an issue as 'report' evidence. Must run inside the report
+   * transaction: the row is locked FOR UPDATE, so a staged upload can never be consumed
+   * twice, by another user, or after expiry. A location mismatch THROWS, rolling back
+   * the report - no photo-less issue is left behind - while the staged row stays
+   * unconsumed so the client can retry with corrected GPS.
+   */
+  async function bindStagedPhoto(c: pg.PoolClient, userId: string, issueId: string, uploadId: string) {
+    const su = await c.query('SELECT * FROM staged_uploads WHERE id=$1 FOR UPDATE', [uploadId]);
+    const s = su.rows[0];
+    if (!s || s.uploader_id !== userId || s.consumed_at || new Date(s.expires_at) < new Date())
+      throw new HttpError(422, 'Photo upload is invalid, expired or already used - stage a fresh photo.', 'invalid_upload');
+    const near = (await c.query(
+      `SELECT ST_DWithin(i.geom, s.claimed_geom, $3) AS ok FROM issues i, staged_uploads s WHERE i.id=$1 AND s.id=$2`, [issueId, uploadId, cfg.evidenceRadiusM])).rows[0].ok;
+    if (!near) throw new HttpError(422, `Photo location must be within ${cfg.evidenceRadiusM} m of the report`, 'location_mismatch');
+    const ev = await c.query(
+      `INSERT INTO evidence (issue_id, uploader_id, kind, storage_key, sha256, content_type, byte_size, width, height, claimed_geom, location_ok)
+       VALUES ($1,$2,'report',$3,$4,$5,$6,$7,$8,$9,true) RETURNING id`,
+      [issueId, userId, s.storage_key, s.sha256, s.content_type, s.byte_size, s.width, s.height, s.claimed_geom]);
+    await c.query('UPDATE staged_uploads SET consumed_at=now(), issue_id=$2 WHERE id=$1', [uploadId, issueId]);
+    return { evidence_id: ev.rows[0].id as string, location_ok: true };
+  }
+
   app.post('/v1/reports', async (req, reply) => {
     const p = await auth(req);
     const b = parse(z.object({
       lat, lon, accuracy_m: z.number().min(0).max(100000).optional(), hazard: z.enum(HAZARDS), danger: z.boolean().default(false),
       note: z.string().trim().max(500).optional(), captured_at: z.string().datetime(),
+      // Photo-mandatory reports: id from POST /v1/uploads/stage. Bound atomically in the
+      // report transaction below. Optional in the schema for old-client compatibility;
+      // PHOTO_REQUIRED=true (deployment owner, after the staging client is live) rejects
+      // its absence - there is no photo-less bypass once the flag is on.
+      photo_upload_id: uuid.optional(),
     }).strict(), req.body);
+    if (!b.photo_upload_id && cfg.photoRequired)
+      throw new HttpError(422, 'A photo is required to file a report. Upload it first (POST /v1/uploads/stage) and pass photo_upload_id.', 'photo_required');
     const idem = (req.headers['idempotency-key'] as string | undefined)?.slice(0, 128);
     const t = now();
     const captured = new Date(b.captured_at);
@@ -138,7 +168,12 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
       await c.query('SELECT pg_advisory_xact_lock(4201)');
       if (idem) {
         const ex = await c.query('SELECT issue_id, id FROM reports WHERE user_id=$1 AND idempotency_key=$2', [p.userId, idem]);
-        if (ex.rowCount) return { issueId: ex.rows[0].issue_id, reportId: ex.rows[0].id, created: false, merged: false, replay: true };
+        if (ex.rowCount) {
+          // Replay: still bind a staged photo if the client sent one (the original attempt
+          // may have crashed between issue creation and evidence binding).
+          const photo = b.photo_upload_id ? await bindStagedPhoto(c, p.userId, ex.rows[0].issue_id, b.photo_upload_id) : null;
+          return { issueId: ex.rows[0].issue_id, reportId: ex.rows[0].id, created: false, merged: false, replay: true, photo };
+        }
       }
       const isTest = !!(await c.query('SELECT is_test FROM users WHERE id=$1', [p.userId])).rows[0]?.is_test;
       const cap = await c.query(`SELECT count(*)::int AS n FROM reports WHERE user_id=$1 AND created_at > now() - interval '24 hours'`, [p.userId]);
@@ -193,10 +228,11 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
         await awardPoints(c, cfg, p.userId, 10, 'verified_report', issueId);
         if (created) await awardPoints(c, cfg, p.userId, 5, 'first_reporter_bonus', issueId);
       }
-      return { issueId, reportId: rep.rows[0].id, created, merged, replay: false };
+      const photo = b.photo_upload_id ? await bindStagedPhoto(c, p.userId, issueId, b.photo_upload_id) : null;
+      return { issueId, reportId: rep.rows[0].id, created, merged, replay: false, photo };
     });
     const row = (await db.query(`SELECT ${ISSUE_COLS} ${ISSUE_FROM} WHERE i.id=$1`, [result.issueId])).rows[0];
-    return reply.status(result.replay ? 200 : result.created ? 201 : 200).send({ report_id: result.reportId, merged_into_existing: result.merged, replayed: result.replay, issue: fullDto(row) });
+    return reply.status(result.replay ? 200 : result.created ? 201 : 200).send({ report_id: result.reportId, merged_into_existing: result.merged, replayed: result.replay, issue: fullDto(row), ...(result.photo ? { photo: result.photo } : {}) });
   });
 
   // ---------- reading issues ----------
@@ -254,6 +290,23 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
       `SELECT u.alias, u.ward, COALESCE(SUM(l.delta),0)::int AS points FROM users u JOIN points_ledger l ON l.user_id=u.id
        WHERE ($1::text IS NULL OR u.ward=$1) AND ($2='all' OR l.created_at > now() - interval '7 days') AND u.is_test = (SELECT is_test FROM users WHERE id=$3) GROUP BY u.id ORDER BY points DESC LIMIT 50`, [q.ward ?? null, q.period, pr.userId]);
     return { leaderboard: r.rows };
+  });
+
+  // ---------- staged uploads (photo-mandatory reports) ----------
+  app.post('/v1/uploads/stage', async (req, reply) => {
+    const p = await auth(req);
+    const q = parse(z.object({ lat, lon }), req.query);
+    if (!Buffer.isBuffer(req.body)) throw new HttpError(415, 'Send the image as the raw request body (image/jpeg, image/png or image/webp)', 'bad_image');
+    // Lazy sweep of expired, unconsumed staged uploads (bounded; blob delete best-effort).
+    const dead = await db.query(`DELETE FROM staged_uploads WHERE consumed_at IS NULL AND expires_at < now() RETURNING storage_key`);
+    for (const r of dead.rows) { try { await store.del?.(r.storage_key); } catch { /* row is gone; an orphan blob is acceptable */ } }
+    const img = await normalizeImage(req.body);
+    const key = await store.put(img.data);
+    const r = await db.query(
+      `INSERT INTO staged_uploads (uploader_id, storage_key, sha256, content_type, byte_size, width, height, claimed_geom)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,ST_SetSRID(ST_MakePoint($9,$8),4326)::geography) RETURNING id, expires_at`,
+      [p.userId, key, img.sha256, img.contentType, img.data.length, img.width, img.height, q.lat, q.lon]);
+    return reply.status(201).send({ upload_id: r.rows[0].id, expires_at: r.rows[0].expires_at, note: 'Private staged photo. It becomes issue evidence only when a report binds it; unbound uploads expire after one hour.' });
   });
 
   // ---------- evidence ----------

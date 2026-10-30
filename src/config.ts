@@ -25,6 +25,8 @@ export type Config = {
   disputeWindowHours: number;
   level2DelayHours: number;
   publicScorecards: boolean;
+  photoRequired: boolean;
+  /** Product requirement: new reports must bind a staged photo. FALSE during the client rollout window; the deployment owner sets PHOTO_REQUIRED=true once the web client stages photos. Server-enforced when true - no bypass route. */
   rateLimitMax: number;
 };
 
@@ -49,6 +51,7 @@ export function defaults(): Omit<Config, 'authIssuer' | 'authAudience' | 'databa
     disputeWindowHours: 48, // PRD
     level2DelayHours: 48, // ASSUMPTION
     publicScorecards: false, // PRD: legal review before publishing contractor performance
+    photoRequired: false, // flipped by the deployment owner after the photo-staging client is live
     rateLimitMax: 120,
   };
 }
@@ -92,5 +95,6 @@ export function fromEnv(env = process.env): Config {
     corsOrigins: (env.CORS_ORIGINS ?? '').split(',').map((x) => x.trim()).filter(Boolean),
     trustProxy: env.TRUST_PROXY === 'true',
     publicScorecards: env.PUBLIC_SCORECARDS === 'true',
+    photoRequired: env.PHOTO_REQUIRED === 'true',
   } as Config;
 }
