@@ -215,6 +215,37 @@ it('repeated reads are idempotent (watermark, no duplicate days)', async () => {
   } finally { await w.close(); }
 });
 
+it('late-committed lower ledger id is still credited (watermark regression)', async () => {
+  const w = await world();
+  const held = await w.admin.connect();
+  try {
+    const id = await w.mkuser('u-late');
+    const t = w.kolkataToday();
+    const y = addDays(t, -1);
+    // Transaction A grabs a LOW sequence id for a YESTERDAY row but stays uncommitted...
+    await held.query('BEGIN');
+    const low = (await held.query(
+      'INSERT INTO points_ledger (user_id, delta, reason, created_at) VALUES ($1,$2,$3,$4) RETURNING id',
+      [id, 10, 'verified_report', `${y}T10:00:00+05:30`])).rows[0].id as number;
+    // ...meanwhile a TODAY row commits with a HIGHER id, and a refresh runs.
+    await w.ledger(id, 10, `${t}T09:00:00+05:30`);
+    const high = (await w.admin.query('SELECT MAX(id)::int AS m FROM points_ledger WHERE user_id=$1', [id])).rows[0].m as number;
+    assert.ok(low < high, 'harness must produce the late-commit ordering');
+    const j1 = (await w.get('u-late', '/v1/me/streaks')).json();
+    assert.equal(j1.credited_days, 1); // only the committed row visible so far
+    // A MAX(id) watermark would now sit at `high` and skip `low` forever after it commits.
+    await held.query('COMMIT');
+    const j2 = (await w.get('u-late', '/v1/me/streaks')).json();
+    assert.equal(j2.credited_days, 2);
+    assert.equal(j2.current_streak, 2);
+    assert.equal(j2.today_credited, true);
+  } finally {
+    await held.query('ROLLBACK').catch(() => {});
+    held.release();
+    await w.close();
+  }
+});
+
 it('negative and zero ledger entries never credit a day', async () => {
   const w = await world();
   try {

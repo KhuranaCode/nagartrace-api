@@ -81,37 +81,43 @@ async function currentTz(c: Q, userId: string, defaultTz: string): Promise<strin
 }
 
 /**
- * Idempotently advances the user's derived streak state from points_ledger.
- * Watermark over points_ledger.id makes re-runs no-ops; a timezone change re-buckets everything.
- * Must run inside a transaction.
+ * Advances the user's derived streak state from points_ledger by FULL recomputation of the
+ * user's positive ledger days (idempotent via ON CONFLICT; a MAX(id) watermark would silently
+ * skip late-committing lower-id rows). A timezone change re-buckets everything.
+ * Must run inside a transaction; serialized by a per-user advisory lock.
  */
 export async function refreshStreaks(c: Q, userId: string, tz: string): Promise<void> {
-  // Serialize concurrent refreshes for the same user (read endpoints can race).
+  // Serialize concurrent refreshes for the same user. The caller (state) already holds this lock
+  // from BEFORE reading the timezone, so a concurrent PATCH timezone write can never be reverted
+  // by a stale read here; the lock is re-entrant within the same transaction, so direct callers
+  // (tests) are still protected.
   await c.query('SELECT pg_advisory_xact_lock(hashtext($1))', ['streaks:' + userId]);
   const pref = await c.query('SELECT tz FROM user_streak_prefs WHERE user_id=$1', [userId]);
-  if (pref.rowCount && pref.rows[0].tz !== tz) {
+  if (!pref.rowCount) {
+    await c.query('INSERT INTO user_streak_prefs (user_id, tz) VALUES ($1,$2) ON CONFLICT (user_id) DO NOTHING', [userId, tz]);
+  } else if (pref.rows[0].tz !== tz) {
     // Day boundaries move with the timezone: re-derive every credited day from the ledger.
     await c.query('DELETE FROM user_streak_days WHERE user_id=$1', [userId]);
-    await c.query(
-      `INSERT INTO user_streaks (user_id, watermark_ledger_id) VALUES ($1, 0)
-       ON CONFLICT (user_id) DO UPDATE SET watermark_ledger_id = 0`, [userId]);
     await c.query('UPDATE user_streak_prefs SET tz=$2, updated_at=now() WHERE user_id=$1', [userId, tz]);
   }
-  const wmRow = (await c.query('SELECT watermark_ledger_id FROM user_streaks WHERE user_id=$1', [userId])).rows[0];
-  const wm = BigInt(wmRow?.watermark_ledger_id ?? 0);
-  // Credit one day per local date, keeping the earliest ledger id of that day as provenance.
+  // Full-correct recomputation, not a MAX(id) watermark delta: sequence ids are assigned at
+  // INSERT time, so a transaction that grabbed a low id can commit AFTER a refresh has already
+  // seen higher ids - a high-water mark would then silently skip that row forever. Per-user
+  // positive ledger volume is bounded by the daily points cap, so re-deriving every day from a
+  // full scan of THIS user's positive rows is cheap and correct regardless of commit order.
+  // ON CONFLICT DO NOTHING keeps re-runs no-ops. The watermark column is still advanced to
+  // max(id) seen for observability only; no correctness depends on it.
   await c.query(
     `INSERT INTO user_streak_days (user_id, local_date, first_ledger_id)
      SELECT DISTINCT ON (d) $1, d, id FROM (
        SELECT id, (created_at AT TIME ZONE $2)::date AS d
-       FROM points_ledger WHERE user_id=$1 AND delta > 0 AND id > $3 ORDER BY id
+       FROM points_ledger WHERE user_id=$1 AND delta > 0 ORDER BY id
      ) s ORDER BY d, id
      ON CONFLICT (user_id, local_date) DO NOTHING`,
-    [userId, tz, wm.toString()]);
+    [userId, tz]);
   const next = (await c.query(
-    `SELECT COALESCE(MAX(id), 0)::text AS m FROM points_ledger WHERE user_id=$1 AND delta > 0 AND id > $2`,
-    [userId, wm.toString()])).rows[0].m as string;
-  const watermark = BigInt(next) > wm ? BigInt(next) : wm;
+    `SELECT COALESCE(MAX(id), 0)::text AS m FROM points_ledger WHERE user_id=$1 AND delta > 0`,
+    [userId])).rows[0].m as string;
   const dayRows = (await c.query(
     `SELECT to_char(local_date, 'YYYY-MM-DD') AS d FROM user_streak_days WHERE user_id=$1 ORDER BY local_date`, [userId])).rows;
   const today = (await c.query(`SELECT to_char((now() AT TIME ZONE $1)::date, 'YYYY-MM-DD') AS t`, [tz])).rows[0].t as string;
@@ -121,7 +127,7 @@ export async function refreshStreaks(c: Q, userId: string, tz: string): Promise<
      VALUES ($1,$2,$3,$4,$5,$6,now())
      ON CONFLICT (user_id) DO UPDATE SET current_streak=$2, longest_streak=$3, credited_days=$4,
        last_credited_date=$5, watermark_ledger_id=$6, updated_at=now()`,
-    [userId, stats.current, stats.longest, stats.total, stats.lastCredited, watermark.toString()]);
+    [userId, stats.current, stats.longest, stats.total, stats.lastCredited, next]);
 }
 
 export type StreakDeps = { cfg: Config; db: pg.Pool; keys: KeyResolver; defaultTz?: string };
@@ -137,7 +143,13 @@ export function registerStreakRoutes(app: FastifyInstance, deps: StreakDeps): vo
     finally { c.release(); }
   }
 
-  async function state(c: Q, userId: string, tz: string) {
+  async function state(c: Q, userId: string, defaultTz: string, overrideTz?: string) {
+    // Lock BEFORE reading the timezone: a concurrent PATCH must serialize here, and the tz we
+    // then read (and bucket by) is guaranteed to be the latest committed value. Previously the
+    // tz was read first and the lock taken inside refreshStreaks, so a stale GET could revert a
+    // concurrent PATCH's timezone write.
+    await c.query('SELECT pg_advisory_xact_lock(hashtext($1))', ['streaks:' + userId]);
+    const tz = overrideTz ?? (await currentTz(c, userId, defaultTz));
     await refreshStreaks(c, userId, tz);
     // date columns are read with to_char: a JS Date round-trip would shift the day in non-UTC processes
     const s = (await c.query(
@@ -164,16 +176,13 @@ export function registerStreakRoutes(app: FastifyInstance, deps: StreakDeps): vo
 
   app.get('/v1/me/streaks', async (req) => {
     const p = await auth(req);
-    return tx(async (c) => state(c, p.userId, await currentTz(c, p.userId, defaultTz)));
+    return tx(async (c) => state(c, p.userId, defaultTz));
   });
 
   app.patch('/v1/me/streaks/timezone', async (req) => {
     const p = await auth(req);
     const b = parse(z.object({ timezone: z.string().min(1).max(64) }).strict(), req.body);
     if (!isValidTimeZone(b.timezone)) throw new HttpError(422, 'Unknown IANA timezone name', 'bad_timezone');
-    return tx(async (c) => {
-      await currentTz(c, p.userId, defaultTz); // ensure prefs row exists before the tz write
-      return state(c, p.userId, b.timezone);
-    });
+    return tx(async (c) => state(c, p.userId, defaultTz, b.timezone));
   });
 }
