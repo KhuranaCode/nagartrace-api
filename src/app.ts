@@ -197,8 +197,7 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
 
   app.post('/v1/ai/report-check', { bodyLimit: 8 * 1024 }, async (req, reply) => {
     const principal = await auth(req);
-    const budget = admitReportCheck(principal.userId);
-    if (!budget.ok) return reply.code(503).send({ ai_available: false, reason: budget.reason });
+    // Validate BEFORE taking a budget slot: a rejected request must never consume one.
     const b = (req.body ?? {}) as { hazard?: string; note?: string; lat?: number; lon?: number; ward?: string };
     const hazardOk = typeof b.hazard === 'string' && (HAZARDS as readonly string[]).includes(b.hazard);
     const latOk = typeof b.lat === 'number' && Number.isFinite(b.lat) && b.lat >= -90 && b.lat <= 90;
@@ -208,6 +207,8 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
     }
     if (b.note !== undefined && (typeof b.note !== 'string' || b.note.length > 2000)) throw new HttpError(400, 'note too long.', 'bad_request');
     if (b.ward !== undefined && (typeof b.ward !== 'string' || b.ward.length > 120)) throw new HttpError(400, 'ward too long.', 'bad_request');
+    const budget = admitReportCheck(principal.userId);
+    if (!budget.ok) return reply.code(503).send({ ai_available: false, reason: budget.reason });
     try {
       const advisory = await reportCheck({ url: cfg.laptopAiUrl, token: cfg.laptopAiToken, model: cfg.laptopAiModel, timeoutMs: cfg.laptopAiTimeoutMs },
         { hazard: b.hazard!, note: b.note, lat: b.lat!, lon: b.lon!, ward: b.ward });

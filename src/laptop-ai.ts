@@ -45,9 +45,20 @@ export function validateLaptopAiConfig(cfg: LaptopAiConfig): { ok: true; base: s
   let u: URL;
   try { u = new URL(cfg.url); } catch { return { ok: false, reason: 'misconfigured' }; }
   if (u.protocol !== 'https:') return { ok: false, reason: 'misconfigured' }; // no plain HTTP, no raw Ollama port
+  // Normalized destination policy: credentials-in-URL, query/fragment, loopback and the default
+  // Ollama port are all rejected - the endpoint must be a deliberate https gateway host.
+  if (u.username || u.password) return { ok: false, reason: 'misconfigured' };
+  if (u.search || u.hash) return { ok: false, reason: 'misconfigured' };
+  const host = u.hostname.toLowerCase();
+  if (host === 'localhost' || host === '127.0.0.1' || host === '::1' || host.endsWith('.local')) return { ok: false, reason: 'misconfigured' };
+  if (/^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(host)) return { ok: false, reason: 'misconfigured' }; // literal private IPs
+  if (u.port === '11434') return { ok: false, reason: 'misconfigured' }; // default raw Ollama port
   if (!cfg.token) return { ok: false, reason: 'misconfigured' }; // gateway secret required
   if (!cfg.model) return { ok: false, reason: 'misconfigured' };
-  return { ok: true, base: cfg.url.replace(/\/+$/, '') };
+  if (!Number.isFinite(cfg.timeoutMs) || cfg.timeoutMs < 1000 || cfg.timeoutMs > 60000) return { ok: false, reason: 'misconfigured' };
+  // Normalized base: origin + cleaned path, no trailing slash; endpoints join below via new URL.
+  const base = `${u.origin}${u.pathname.replace(/\/+$/, '')}`;
+  return { ok: true, base };
 }
 
 function headers(token: string): Record<string, string> {
@@ -60,10 +71,23 @@ async function fetchTextWithTimeout(url: string, init: RequestInit, timeoutMs: n
   const t = setTimeout(() => ac.abort(), timeoutMs);
   try {
     const res = await fetch(url, { ...init, signal: ac.signal, redirect: 'error' });
-    const body = await res.text(); // still under the clock: body dribble cannot outlive the timeout
-    if (body.length > 1024 * 1024) throw new LaptopAiError('bad_output', 'laptop response exceeded 1MB cap');
+    // Bounded streaming read: abort the moment the cap is exceeded - never allocate an unbounded body.
+    const CAP = 1024 * 1024;
+    const reader = res.body?.getReader();
+    if (!reader) return { status: res.status, body: '' };
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read(); // still under the clock: dribble cannot outlive the timeout
+      if (done) break;
+      total += value.byteLength;
+      if (total > CAP) { ac.abort(); throw new LaptopAiError('bad_output', 'laptop response exceeded 1MB cap'); }
+      chunks.push(value);
+    }
+    const body = new TextDecoder().decode(Buffer.concat(chunks.map((c) => Buffer.from(c))));
     return { status: res.status, body };
   } catch (e: any) {
+    if (e instanceof LaptopAiError) throw e; // our own typed errors (e.g. size cap) pass through unchanged
     if (e?.name === 'AbortError') throw new LaptopAiError('timeout', 'laptop inference timed out');
     throw new LaptopAiError('laptop_unreachable', `laptop endpoint unreachable: ${e?.message ?? e}`);
   } finally {
@@ -75,6 +99,8 @@ async function fetchTextWithTimeout(url: string, init: RequestInit, timeoutMs: n
 export async function laptopAiStatus(cfg: LaptopAiConfig): Promise<{ configured: boolean; available: boolean; model?: string; reason?: string }> {
   const v = validateLaptopAiConfig(cfg);
   if (!v.ok) return { configured: v.reason === 'misconfigured', available: false, reason: v.reason };
+  const budget = admitStatus();
+  if (!budget.ok) return { configured: true, available: false, reason: 'busy' };
   try {
     const r = await fetchTextWithTimeout(`${v.base}/api/tags`, { headers: headers(cfg.token!) }, Math.min(cfg.timeoutMs, 5000));
     if (r.status === 401 || r.status === 403) return { configured: true, available: false, reason: 'gateway_auth_refused' };
@@ -82,12 +108,14 @@ export async function laptopAiStatus(cfg: LaptopAiConfig): Promise<{ configured:
     let tags: any;
     try { tags = JSON.parse(r.body); } catch { return { configured: true, available: false, reason: 'bad_output' }; }
     const models: string[] = Array.isArray(tags?.models) ? tags.models.map((m: any) => String(m?.name ?? '')) : [];
-    if (!models.some((n) => n === cfg.model || n.startsWith(cfg.model + ':') || cfg.model.startsWith(n + ':'))) {
+    if (!models.some((n) => n === cfg.model || n === `${cfg.model}:latest`)) {
       return { configured: true, available: false, reason: 'model_missing', model: cfg.model };
     }
     return { configured: true, available: true, model: cfg.model };
   } catch (e: any) {
     return { configured: true, available: false, reason: e instanceof LaptopAiError ? e.reason : 'laptop_unreachable' };
+  } finally {
+    budget.done();
   }
 }
 
@@ -103,13 +131,31 @@ const USER_WINDOW_MS = 10 * 60 * 1000;
 const USER_MAX = 5;
 const INFLIGHT_MAX = 2;
 
+function prunePerUser(now: number): void {
+  if (perUser.size <= 1000) return;
+  for (const [k, arr] of perUser) {
+    const live = arr.filter((t) => now - t < USER_WINDOW_MS);
+    if (live.length === 0) perUser.delete(k); else perUser.set(k, live);
+  }
+}
+
 export function admitReportCheck(userId: string): { ok: true; done: () => void } | { ok: false; reason: 'rate_limited' | 'busy' } {
   const now = Date.now();
+  prunePerUser(now);
   const arr = (perUser.get(userId) ?? []).filter((t) => now - t < USER_WINDOW_MS);
   if (arr.length >= USER_MAX) { perUser.set(userId, arr); return { ok: false, reason: 'rate_limited' }; }
   if (inFlight >= INFLIGHT_MAX) return { ok: false, reason: 'busy' };
   arr.push(now);
   perUser.set(userId, arr);
+  inFlight += 1;
+  let closed = false;
+  return { ok: true, done: () => { if (!closed) { closed = true; inFlight -= 1; } } };
+}
+
+/** Status probes share the same global in-flight budget (no per-user tally): a burst of
+ *  status checks cannot fan out unbounded /api/tags calls to the laptop either. */
+export function admitStatus(): { ok: true; done: () => void } | { ok: false; reason: 'busy' } {
+  if (inFlight >= INFLIGHT_MAX) return { ok: false, reason: 'busy' };
   inFlight += 1;
   let closed = false;
   return { ok: true, done: () => { if (!closed) { closed = true; inFlight -= 1; } } };
@@ -122,7 +168,7 @@ Rules: never claim the report is verified. Never invent facts not in the input. 
 const HAZARD_KEYS = ['pothole', 'crack', 'waterlogging', 'broken_edge', 'missing_cover', 'other'];
 
 /** Strict shape check on model output; anything odd is bad_output, never a partial pass. */
-function parseAdvisory(raw: string, model: string): Advisory {
+export function parseAdvisory(raw: string, model: string): Advisory {
   let parsed: any;
   try { parsed = JSON.parse(raw); } catch { throw new LaptopAiError('bad_output', 'model reply was not JSON'); }
   if (typeof parsed?.summary !== 'string' || parsed.summary.trim().length === 0 || parsed.summary.length > 500) {
@@ -138,9 +184,14 @@ function parseAdvisory(raw: string, model: string): Advisory {
     const h = parsed.suggested_hazard.trim().toLowerCase();
     if (HAZARD_KEYS.includes(h)) hazard = h;
   }
-  const missing = Array.isArray(parsed.missing_details)
-    ? parsed.missing_details.filter((x: any) => typeof x === 'string' && x.length > 0 && x.length <= 120).slice(0, 5)
-    : [];
+  if (parsed.missing_details !== undefined && !Array.isArray(parsed.missing_details)) {
+    throw new LaptopAiError('bad_output', 'missing_details was not an array');
+  }
+  const rawMissing: any[] = parsed.missing_details ?? [];
+  if (rawMissing.some((x) => typeof x !== 'string' || x.length === 0 || x.length > 120)) {
+    throw new LaptopAiError('bad_output', 'missing_details item outside bounds');
+  }
+  const missing = rawMissing.slice(0, 5);
   return {
     summary: parsed.summary.trim(),
     severity_hint: sev ?? null,
