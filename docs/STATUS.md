@@ -2,7 +2,7 @@
 
 Backend built from the NagarTrace product requirements (v1.0). Not production-ready. Policy values the requirements leave open are provisional config.
 
-## What exists and is tested (51 tests (api + hardening + findings + contract), real PostgreSQL 14 + PostGIS 3.2, API connects as a restricted DB role)
+## What exists and is tested (52 tests (api + hardening + findings + contract), real PostgreSQL 14 + PostGIS 3.2, API connects as a restricted DB role)
 - Token verification: issuer, audience, expiry, signature, algorithm allowlist. Identity = (issuer, subject). Roles come only from the database. Self-grant attempts (token claims, profile fields, admin endpoints) tested.
 - Reports: photo-less intake with GPS/time/accuracy checks, per-user daily cap, idempotency key, duplicate merge within 30 m (same hazard type), concurrent-report test (6 parallel -> 1 issue).
 - Routing per PRD order: unknown road -> municipality + flag; recent utility cut -> utility (beats warranty); warranty -> contractor, municipality copied; else municipality. Deadlines 7 d / 48 h (severity >= 4).
@@ -16,7 +16,7 @@ Backend built from the NagarTrace product requirements (v1.0). Not production-re
 - Image uploads: content sniffing, bounded decode, JPEG re-encode, metadata stripped. Private; never public.
 
 ## Not built / not claimed
-- Hosting, hosted auth provider, object storage (local-disk store only), backups, monitoring.
+- Hosting, hosted auth provider, object storage beyond one synthetic Supabase run, backups, monitoring.
 - Face/number-plate blur (no evaluated mechanism). Re-encoding is not redaction. Photos stay private.
 - Weekly ward leaderboard polish, "false report" penalty (-10), report rejection flow, offline queue, email/SMS/in-app notifications, filters by responsible party, map tiles, hotspot analytics, AI suggestions.
 - Severity does not use road type (not in the data model).
