@@ -20,7 +20,11 @@ export async function authenticate(header: string | undefined, cfg: Config, keys
     });
     if (typeof payload.sub !== 'string' || !payload.sub || payload.sub.length > 255) throw new Error('bad sub');
     sub = payload.sub; iss = String(payload.iss);
-    if (typeof payload.email === 'string' && payload.email.length <= 320) email = payload.email;
+    // Bind ONLY an issuer-verified address: a signed email claim alone is not proof the address
+    // is confirmed. Supabase access tokens document no verification claim (see followup.ts header),
+    // so without an explicit marker the address is treated as unavailable, never as verified.
+    if (typeof payload.email === 'string' && payload.email.length <= 320
+        && (payload.email_verified === true || (payload.user_metadata as any)?.email_verified === true)) email = payload.email;
   } catch {
     throw new HttpError(401, 'Invalid token', 'unauthenticated');
   }

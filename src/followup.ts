@@ -28,6 +28,25 @@
  *  - Exclusive claim: claiming flips state to 'attempting' in the claim statement itself.
  *    A crash leaves 'attempting', recovered to 'unknown' after 2 min - never resent blindly.
  *  - 'accepted' is never called 'delivered'. Delivery confirmation is a future webhook scope.
+ *
+ * Stop-before-send linearizability: each claimed delivery is processed in a transaction that
+ * locks the campaign row (FOR UPDATE) and then the consent row (FOR UPDATE) BEFORE any gate
+ * decision, and every state write is conditional on the row still being 'attempting'. Revoke
+ * endpoints write in the same lock order (campaign -> deliveries; consent -> deliveries). So a
+ * revoke either COMMITS before the sweep's lock (sweep sees it, no send) or blocks until the
+ * sweep commits (send already finished; revoke returns after). A revoke can never observe 200
+ * and still have a send happen afterwards, and a concurrent stop is never overwritten.
+ * Future provider scope: the send call happens inside this transaction; a real provider MUST
+ * keep this window small or move to a claim-token design - the conditional writes already
+ * guarantee no state corruption either way.
+ *
+ * Verified recipient: Principal.email is set ONLY when the issuer's token carries an explicit
+ * verified marker (email_verified === true, top-level or user_metadata). Supabase access
+ * tokens document NO email-verification claim (official JWT fields reference,
+ * supabase.com/docs/guides/auth/jwt-fields, read 2026-10-30: email + user_metadata only), so
+ * with a stock Supabase issuer campaign creation honestly returns signin_email_unavailable.
+ * Binding to a server-confirmed address is owner-surface future scope (Supabase project
+ * settings / Management API), coordinated via the infra owner - NOT assumed here.
  */
 import { createHash } from 'node:crypto';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
@@ -64,6 +83,19 @@ export function stageContentSha(s: { day: number; subject: string; body_text: st
   return createHash('sha256').update(JSON.stringify({ day: s.day, subject: s.subject, body_text: s.body_text, body_html: s.body_html ?? '' })).digest('hex');
 }
 
+/** Canonical stage shape: fixed key order, fixed field set, sorted by day. Used BOTH when
+ *  storing and when comparing, so a jsonb round-trip (key reordering) can never turn an
+ *  identical replay into a false 409. */
+export function canonicalStage(s: { day: number; subject: string; body_text: string; body_html?: string }) {
+  return { day: Number(s.day), subject: String(s.subject), body_text: String(s.body_text), body_html: String(s.body_html ?? '') };
+}
+export function canonicalStages(stages: any[]) {
+  return (stages as any[]).map(canonicalStage).sort((a, b) => a.day - b.day);
+}
+export function campaignPayloadSha(stages: any[]): string {
+  return createHash('sha256').update(JSON.stringify(canonicalStages(stages).map((s) => ({ ...s, content_sha256: stageContentSha(s) })))).digest('hex');
+}
+
 export function sendKey(campaignId: string, stageDay: number, contentSha: string): string {
   return createHash('sha256').update(`${campaignId}|${stageDay}|${contentSha}`).digest('hex');
 }
@@ -77,119 +109,119 @@ export async function sweepFollowups(db: pg.Pool, sender: Sender, maxAttempts = 
     `UPDATE followup_delivery SET state='unknown', updated_at=now()
       WHERE state='attempting' AND updated_at < now() - interval '2 minutes'`);
   // Exclusive claim: state flips to 'attempting' IN THE CLAIM STATEMENT, so once committed no
-  // other worker can select the row. Every branch writes a non-attempting terminal state.
+  // other worker can select the row. 'failed' is terminal and never re-claimed; a retryable
+  // provider failure is written back as 'pending' instead (see outcome writes below).
   const due = await db.query(
     `WITH c AS (
-       SELECT d.id, d.state AS prior_state, d.updated_at AS prior_updated_at FROM followup_delivery d
+       SELECT d.id, d.state AS prior_state FROM followup_delivery d
         WHERE d.due_at <= now()
-          AND d.state IN ('pending','unknown','blocked_no_provider','failed')
+          AND d.state IN ('pending','unknown','blocked_no_provider')
         ORDER BY d.id LIMIT 50
         FOR UPDATE OF d SKIP LOCKED)
      UPDATE followup_delivery d SET state='attempting', updated_at=now() FROM c WHERE d.id = c.id
-     RETURNING d.id AS delivery_id, c.prior_state AS prior_state, d.send_key, d.attempt_count,
-       d.provider_message_id, d.first_attempt_at, d.rendered_subject, d.rendered_text, d.rendered_html, d.stage_day,
-       (SELECT c2.id FROM followup_campaign c2 WHERE c2.id = d.campaign_id) AS campaign_id,
-       (SELECT c2.recipient_address FROM followup_campaign c2 WHERE c2.id = d.campaign_id) AS recipient_address,
-       (SELECT c2.recipient_verified FROM followup_campaign c2 WHERE c2.id = d.campaign_id) AS recipient_verified,
-       (SELECT c2.stages FROM followup_campaign c2 WHERE c2.id = d.campaign_id) AS stages,
-       (SELECT c2.state FROM followup_campaign c2 WHERE c2.id = d.campaign_id) AS campaign_state,
-       (SELECT i.status FROM issues i JOIN followup_campaign c3 ON c3.issue_id=i.id WHERE c3.id=d.campaign_id) AS issue_status`);
+     RETURNING d.id AS delivery_id, c.prior_state AS prior_state, d.campaign_id, d.send_key, d.attempt_count,
+       d.provider_message_id, d.first_attempt_at, d.rendered_subject, d.rendered_text, d.rendered_html, d.stage_day`);
   let sent = 0;
   for (const r of due.rows) {
-    // 1. Resolution: stop everything for resolved issues or non-active campaigns.
-    if (r.issue_status === 'fixed' || r.issue_status === 'rejected' || r.campaign_state !== 'active') {
-      await db.query(`UPDATE followup_delivery SET state='suppressed', updated_at=now() WHERE id=$1`, [r.delivery_id]);
-      if (r.campaign_state === 'active')
-        await db.query(`UPDATE followup_campaign SET state='stopped_resolved' WHERE id=$1`, [r.campaign_id]);
-      bump('suppressed'); continue;
-    }
-    // 2. Consent still granted?
-    const consent = await db.query(
-      `SELECT granted FROM user_mail_consent WHERE user_id=(SELECT owner_user_id FROM followup_campaign WHERE id=$1) AND kind='report_reminders'`,
-      [r.campaign_id]);
-    if (!consent.rows[0]?.granted) {
-      await db.query(`UPDATE followup_delivery SET state='blocked_no_consent', updated_at=now() WHERE id=$1`, [r.delivery_id]);
-      bump('blocked_no_consent'); continue;
-    }
-    // 3. Verified recipient with a concrete address?
-    if (!r.recipient_verified || !r.recipient_address) {
-      await db.query(`UPDATE followup_delivery SET state='blocked_no_recipient', updated_at=now() WHERE id=$1`, [r.delivery_id]);
-      bump('blocked_no_recipient'); continue;
-    }
-    // 4. Unknown previous attempt: reconcile first, NEVER blind resend. A 'key:' attempt may only
-    //    fall through to an idempotent retry INSIDE the provider's documented window, anchored at
-    //    first_attempt_at (the TTL belongs to the FIRST attempt and is never refreshed by passes).
-    if (r.prior_state === 'unknown') {
-      const attemptId = r.provider_message_id ?? '';
-      const retryMinutes = sender.idempotentRetryMinutes ?? 0;
-      const ageMs = r.first_attempt_at ? Date.now() - new Date(r.first_attempt_at).getTime() : Number.POSITIVE_INFINITY;
-      const insideWindow = attemptId.startsWith('key:') && retryMinutes > 0 && ageMs < retryMinutes * 60000;
-      if (!insideWindow) {
-        const verdict = sender.reconcile ? await sender.reconcile(attemptId) : null;
-        if (verdict === 'accepted') {
-          await db.query(`UPDATE followup_delivery SET state='accepted', updated_at=now() WHERE id=$1`, [r.delivery_id]);
-          bump('accepted');
-        } else if (verdict === 'failed' && r.attempt_count < maxAttempts) {
-          await db.query(`UPDATE followup_delivery SET state='pending', updated_at=now() WHERE id=$1`, [r.delivery_id]);
-          bump('pending');
-        } else {
-          await db.query(`UPDATE followup_delivery SET state='unknown' WHERE id=$1`, [r.delivery_id]); // stays manual; no refreshed claim timestamp
-          bump('unknown');
-        }
-        continue;
+    // Per-delivery transaction: lock campaign THEN consent (the same order revoke endpoints
+    // write in) before any decision, so a committed revoke is always seen and an in-flight
+    // revoke always waits. Every write is conditional on state='attempting': a concurrent
+    // stop (suppress/revoke between claim and write) is NEVER overwritten.
+    const cx = await db.connect();
+    try {
+      await cx.query('BEGIN');
+      const fin = async (state: string, opts: { touch?: boolean; extra?: string; params?: any[] } = {}) => {
+        const u = await cx.query(
+          `UPDATE followup_delivery SET state=$2${opts.touch === false ? '' : ', updated_at=now()'} ${opts.extra ?? ''}
+             WHERE id=$1 AND state='attempting'`, [r.delivery_id, state, ...(opts.params ?? [])]);
+        const n = u.rowCount ?? 0;
+        if (n === 0) bump('stopped_concurrently'); else bump(state);
+        return n > 0;
+      };
+      const camp = (await cx.query(
+        `SELECT c.state, c.issue_id, c.owner_user_id, c.recipient_address, c.recipient_verified, c.stages,
+                (SELECT i.status FROM issues i WHERE i.id=c.issue_id) AS issue_status
+           FROM followup_campaign c WHERE c.id=$1 FOR UPDATE`, [r.campaign_id])).rows[0];
+      // 1. Resolution / campaign state: stop everything for resolved issues or stopped campaigns.
+      if (!camp || camp.state !== 'active' || camp.issue_status === 'fixed' || camp.issue_status === 'rejected') {
+        // An 'unknown' row records a real attempt with an uncertain outcome: never erase that
+        // truth just because the campaign stopped. It stays manual-reconciliation only.
+        if (r.prior_state === 'unknown') await fin('unknown', { touch: false });
+        else await fin('suppressed');
+        if (camp && camp.state === 'active')
+          await cx.query(`UPDATE followup_campaign SET state='stopped_resolved' WHERE id=$1 AND state='active'`, [r.campaign_id]);
+        await cx.query('COMMIT'); continue;
       }
-    }
-    // 5. Attempt cap - persisted, not just reported.
-    if (r.attempt_count >= maxAttempts) {
-      await db.query(`UPDATE followup_delivery SET state='failed', last_error='attempt_cap_reached', updated_at=now() WHERE id=$1`, [r.delivery_id]);
-      bump('failed'); continue;
-    }
-    // 6. Provider gate: NoProvider leaves the honest blocked state.
-    if (sender.name === 'none') {
-      await db.query(`UPDATE followup_delivery SET state='blocked_no_provider', updated_at=now() WHERE id=$1`, [r.delivery_id]);
-      bump('blocked_no_provider'); continue;
-    }
-    // 7. Pre-send recheck (gates can have changed since the claim): campaign still active,
-    //    consent still granted, issue still unresolved. A revoke between claim and send stops the send.
-    const recheck = (await db.query(
-      `SELECT (SELECT c2.state FROM followup_campaign c2 WHERE c2.id=$1) AS cs,
-              (SELECT granted FROM user_mail_consent WHERE user_id=(SELECT owner_user_id FROM followup_campaign WHERE id=$1) AND kind='report_reminders') AS granted,
-              (SELECT i.status FROM issues i JOIN followup_campaign c3 ON c3.issue_id=i.id WHERE c3.id=$1) AS ist`,
-      [r.campaign_id])).rows[0];
-    if (recheck.cs !== 'active' || recheck.ist === 'fixed' || recheck.ist === 'rejected') {
-      await db.query(`UPDATE followup_delivery SET state='suppressed', updated_at=now() WHERE id=$1`, [r.delivery_id]);
-      bump('suppressed'); continue;
-    }
-    if (!recheck.granted) {
-      await db.query(`UPDATE followup_delivery SET state='blocked_no_consent', updated_at=now() WHERE id=$1`, [r.delivery_id]);
-      bump('blocked_no_consent'); continue;
-    }
-    // 8. Send with the IMMUTABLE payload: rendered once, persisted, reused on every retry.
-    const stage = (r.stages as any[]).find((s: any) => s.day === Number(r.stage_day)) ?? (r.stages as any[])[0];
-    let { rendered_subject: subj, rendered_text: text, rendered_html: html } = r;
-    if (!subj) {
-      subj = String(stage.subject).replaceAll('{{status}}', r.issue_status);
-      text = String(stage.body_text).replaceAll('{{status}}', r.issue_status);
-      html = String(stage.body_html ?? '').replaceAll('{{status}}', r.issue_status);
-      await db.query(
-        `UPDATE followup_delivery SET rendered_subject=$2, rendered_text=$3, rendered_html=$4, first_attempt_at=now(), attempt_count=attempt_count+1, updated_at=now() WHERE id=$1`,
-        [r.delivery_id, subj, text, html]);
-    } else {
-      await db.query(`UPDATE followup_delivery SET attempt_count=attempt_count+1, updated_at=now() WHERE id=$1`, [r.delivery_id]);
-    }
-    const res = await sender.send({ sendKey: r.send_key, to: r.recipient_address, subject: subj, text, html });
-    if (res.outcome === 'accepted') {
-      await db.query(`UPDATE followup_delivery SET state='accepted', provider=$2, provider_message_id=$3, updated_at=now() WHERE id=$1`,
-        [r.delivery_id, sender.name, res.providerMessageId]);
-      sent++; bump('accepted');
-    } else if (res.outcome === 'unknown') {
-      await db.query(`UPDATE followup_delivery SET state='unknown', provider=$2, provider_message_id=$3, updated_at=now() WHERE id=$1`,
-        [r.delivery_id, sender.name, res.attemptId]);
-      bump('unknown');
-    } else {
-      await db.query(`UPDATE followup_delivery SET state='failed', last_error=$2, updated_at=now() WHERE id=$1`, [r.delivery_id, res.reason]);
-      bump('failed');
-    }
+      // 2. Consent still granted AT THE CURRENT scope version. A version bump must never honor
+      //    an older grant: it blocks honestly until the owner re-consents to the new text.
+      const consent = (await cx.query(
+        `SELECT granted, scope_version FROM user_mail_consent WHERE user_id=$1 AND kind='report_reminders' FOR UPDATE`,
+        [camp.owner_user_id])).rows[0];
+      if (!consent?.granted || consent.scope_version !== FOLLOWUP_CONSENT_VERSION) {
+        await fin('blocked_no_consent', { extra: `, last_error=$3`, params: [consent?.granted ? 'consent_version_changed' : 'consent_not_granted'] });
+        await cx.query('COMMIT'); continue;
+      }
+      // 3. Verified recipient with a concrete address?
+      if (!camp.recipient_verified || !camp.recipient_address) {
+        await fin('blocked_no_recipient');
+        await cx.query('COMMIT'); continue;
+      }
+      // 4. Unknown previous attempt: reconcile first, NEVER blind resend. A 'key:' attempt may only
+      //    fall through to an idempotent retry INSIDE the provider's documented window, anchored at
+      //    first_attempt_at (the TTL belongs to the FIRST attempt and is never refreshed by passes).
+      if (r.prior_state === 'unknown') {
+        const attemptId = r.provider_message_id ?? '';
+        const retryMinutes = sender.idempotentRetryMinutes ?? 0;
+        const ageMs = r.first_attempt_at ? Date.now() - new Date(r.first_attempt_at).getTime() : Number.POSITIVE_INFINITY;
+        const insideWindow = attemptId.startsWith('key:') && retryMinutes > 0 && ageMs < retryMinutes * 60000;
+        if (!insideWindow) {
+          const verdict = sender.reconcile ? await sender.reconcile(attemptId) : null;
+          if (verdict === 'accepted') await fin('accepted');
+          else if (verdict === 'failed' && r.attempt_count < maxAttempts) await fin('pending');
+          else await fin('unknown', { touch: false }); // stays manual; no refreshed claim timestamp
+          await cx.query('COMMIT'); continue;
+        }
+      }
+      // 5. Attempt cap - persisted, not just reported.
+      if (r.attempt_count >= maxAttempts) {
+        await fin('failed', { extra: `, last_error=$3`, params: ['attempt_cap_reached'] });
+        await cx.query('COMMIT'); continue;
+      }
+      // 6. Provider gate: NoProvider leaves the honest blocked state.
+      if (sender.name === 'none') {
+        await fin('blocked_no_provider');
+        await cx.query('COMMIT'); continue;
+      }
+      // 7. Immutable payload: rendered once ({{status}} substituted), persisted, reused on retry.
+      //    The pre-send state was re-read under locks above; a revoke either already committed
+      //    (seen here) or waits for this COMMIT - it can never return 200 before this send.
+      const stage = (camp.stages as any[]).find((s: any) => s.day === Number(r.stage_day)) ?? (camp.stages as any[])[0];
+      let { rendered_subject: subj, rendered_text: text, rendered_html: html } = r;
+      if (!subj) {
+        subj = String(stage.subject).replaceAll('{{status}}', camp.issue_status);
+        text = String(stage.body_text).replaceAll('{{status}}', camp.issue_status);
+        html = String(stage.body_html ?? '').replaceAll('{{status}}', camp.issue_status);
+        await cx.query(
+          `UPDATE followup_delivery SET rendered_subject=$2, rendered_text=$3, rendered_html=$4, first_attempt_at=now(), attempt_count=attempt_count+1, updated_at=now() WHERE id=$1 AND state='attempting'`,
+          [r.delivery_id, subj, text, html]);
+      } else {
+        await cx.query(`UPDATE followup_delivery SET attempt_count=attempt_count+1, updated_at=now() WHERE id=$1 AND state='attempting'`, [r.delivery_id]);
+      }
+      const res = await sender.send({ sendKey: r.send_key, to: camp.recipient_address, subject: subj, text, html });
+      if (res.outcome === 'accepted') {
+        if (await fin('accepted', { extra: `, provider=$3, provider_message_id=$4`, params: [sender.name, res.providerMessageId] })) sent++;
+      } else if (res.outcome === 'unknown') {
+        await fin('unknown', { extra: `, provider=$3, provider_message_id=$4`, params: [sender.name, res.attemptId] });
+      } else if (res.retryable) {
+        await fin('pending', { extra: `, last_error=$3`, params: [res.reason] }); // retryable: back to pending, cap still applies
+      } else {
+        await fin('failed', { extra: `, last_error=$3`, params: [res.reason] });
+      }
+      await cx.query('COMMIT');
+    } catch (e) {
+      await cx.query('ROLLBACK').catch(() => {});
+      throw e;
+    } finally { cx.release(); }
   }
   return { sent, states };
 }
@@ -218,11 +250,14 @@ export function registerFollowupRoutes(app: FastifyInstance, deps: { cfg: Config
          granted_at=CASE WHEN $4 THEN now() ELSE user_mail_consent.granted_at END,
          revoked_at=CASE WHEN NOT $4 THEN now() ELSE user_mail_consent.revoked_at END, updated_at=now()`,
       [p.userId, kind, scope_version, granted]);
-    if (!granted) // revoking blocks every not-yet-accepted delivery immediately
+    if (!granted) // revoking blocks deliveries that have not been attempted yet. 'unknown' and
+      // 'failed' are preserved TRUTHS about actual provider attempts - they are never rewritten
+      // by consent state and never re-armed as fresh pending by a later re-grant. A post-revoke
+      // send of a claimed/unknown row is stopped by the locked pre-send consent gate in the sweep.
       await db.query(
         `UPDATE followup_delivery d SET state='blocked_no_consent', updated_at=now()
            FROM followup_campaign c
-          WHERE d.campaign_id=c.id AND c.owner_user_id=$1 AND d.state IN ('pending','blocked_no_provider','blocked_no_recipient','failed','unknown')`,
+          WHERE d.campaign_id=c.id AND c.owner_user_id=$1 AND d.state IN ('pending','blocked_no_provider','blocked_no_recipient')`,
         [p.userId]);
     else // re-granting re-arms deliveries that were blocked only by the revoked consent
       await db.query(
@@ -250,6 +285,8 @@ export function registerFollowupRoutes(app: FastifyInstance, deps: { cfg: Config
     if (!idempotency_key || typeof idempotency_key !== 'string') throw new HttpError(400, 'idempotency_key required', 'bad_idempotency_key');
     const consent = await db.query(`SELECT granted, scope_version FROM user_mail_consent WHERE user_id=$1 AND kind='report_reminders'`, [p.userId]);
     if (!consent.rows[0]?.granted) throw new HttpError(403, 'reminder consent required first', 'consent_required');
+    if (consent.rows[0].scope_version !== FOLLOWUP_CONSENT_VERSION)
+      throw new HttpError(403, 'reminder consent was given for an older text version; please review and re-consent', 'consent_version_changed');
     // Reporter/self: the concrete recipient is the AUTHENTICATED sign-in email from the verified
     // token - never a client-supplied address. A body value that disagrees is rejected, not stored.
     let address: string | null = null;
@@ -260,11 +297,11 @@ export function registerFollowupRoutes(app: FastifyInstance, deps: { cfg: Config
       if (typeof recipient_email !== 'string' || recipient_email.toLowerCase() !== p.email.toLowerCase())
         throw new HttpError(403, 'recipient_email must be your own sign-in address', 'recipient_mismatch');
       address = p.email;
-      recipientVerified = true; // narrow sense: sign-in mail reaches it; email-confirmation is a Supabase deployment setting (owner surface)
+      recipientVerified = true; // p.email exists ONLY with an issuer-verified marker (see auth.ts + header)
     }
     const descriptor = audience === 'reporter' ? 'self' : String(recipient_descriptor ?? '');
     if (audience === 'authority' && !descriptor) throw new HttpError(400, 'recipient_required', 'recipient_required');
-    const enriched = stages.map((s: any) => ({ ...s, content_sha256: stageContentSha(s) }));
+    const enriched = canonicalStages(stages).map((s: any) => ({ ...s, content_sha256: stageContentSha(s) }));
     const client = await db.connect();
     try {
       await client.query('BEGIN');
@@ -281,9 +318,10 @@ export function registerFollowupRoutes(app: FastifyInstance, deps: { cfg: Config
         const existing = (await db.query(
           `SELECT id, issue_id, audience, recipient_address, stages FROM followup_campaign WHERE owner_user_id=$1 AND idempotency_key=$2`,
           [p.userId, idempotency_key])).rows[0];
+        // Canonical compare: jsonb key ordering can never make an identical replay look different.
         const same = existing && existing.issue_id === issueId && existing.audience === audience
           && (existing.recipient_address ?? null) === address
-          && JSON.stringify(existing.stages) === JSON.stringify(enriched);
+          && campaignPayloadSha(existing.stages) === campaignPayloadSha(enriched);
         if (!same) throw new HttpError(409, 'same idempotency key with a different payload', 'idempotency_mismatch');
         return reply.status(200).send({ campaign_id: existing.id, replayed: true });
       }
@@ -317,7 +355,7 @@ export function registerFollowupRoutes(app: FastifyInstance, deps: { cfg: Config
     if (r.rows.length === 0) throw new HttpError(404, 'no active reminder plan found', 'not_found');
     await db.query(
       `UPDATE followup_delivery SET state='suppressed', updated_at=now()
-        WHERE campaign_id=$1 AND state IN ('pending','blocked_no_provider','blocked_no_consent','blocked_no_recipient','failed','unknown')`,
+        WHERE campaign_id=$1 AND state IN ('pending','attempting','blocked_no_provider','blocked_no_consent','blocked_no_recipient')`,
       [(req.params as any).id]);
     return { revoked: true };
   });

@@ -23,7 +23,7 @@ class FakeSender implements Sender {
 }
 
 async function mkUser(email?: string) {
-  const t = await sign('u-' + uniq(), email ? { extra: { email } } : {});
+  const t = await sign('u-' + uniq(), email ? { extra: { email, email_verified: true } } : {});
   const c = client(w, t);
   const me = (await c.get('/v1/me')).json;
   return { t, c, id: me.id as string };
@@ -215,7 +215,7 @@ test('revoke between claim and send stops the send (pre-send recheck)', async ()
   assert.equal((await w.adminDb.query(`SELECT state FROM followup_delivery WHERE campaign_id=$1 AND stage_day=7`, [cid])).rows[0].state, 'suppressed');
 });
 
-test('campaign revoke suppresses unknown and pending; consent revoke blocks and re-grant re-arms', async () => {
+test('campaign revoke suppresses pending but preserves unknown attempt truth; consent revoke blocks and re-grant re-arms', async () => {
   const u = await mkUser('rw@example.in'); const issueId = await mkIssue(u.c);
   await consent(u.c);
   const cid = (await create(u.c, issueId, 'k-' + uniq(), 'rw@example.in')).json.campaign_id;
@@ -223,7 +223,7 @@ test('campaign revoke suppresses unknown and pending; consent revoke blocks and 
   const del = await u.c.delete(`/v1/followup-campaigns/${cid}`);
   assert.equal(del.status, 200);
   const states = (await w.adminDb.query(`SELECT state FROM followup_delivery WHERE campaign_id=$1 ORDER BY stage_day`, [cid])).rows.map((x: any) => x.state);
-  assert.deepEqual(states, ['suppressed', 'suppressed', 'suppressed', 'suppressed']);
+  assert.deepEqual(states, ['unknown', 'suppressed', 'suppressed', 'suppressed']); // unknown = real attempt, uncertain outcome: preserved
   // consent revoke blocks, re-grant re-arms to pending
   const u2 = await mkUser('rw2@example.in'); const i2 = await mkIssue(u2.c);
   await consent(u2.c);
@@ -252,4 +252,109 @@ test('admin sweep job: municipal admin only, and it is NoProvider by constructio
   assert.equal(ok.json.states.blocked_no_provider, 4);
   const rows14 = (await w.adminDb.query(`SELECT state FROM followup_delivery WHERE campaign_id=$1`, [cid14])).rows;
   assert.ok(rows14.every((x: any) => x.state === 'blocked_no_provider'));
+});
+
+// --- Regressions from the b051dd9 runtime review artifact ---
+
+test('regression: unknown attempt survives consent revoke + re-grant, never re-armed or resent', async () => {
+  const u = await mkUser('ru@example.in'); const issueId = await mkIssue(u.c);
+  await consent(u.c);
+  const cid = (await create(u.c, issueId, 'k-' + uniq(), 'ru@example.in')).json.campaign_id;
+  await isolate(cid, [7]);
+  await w.adminDb.query(`UPDATE followup_delivery SET state='unknown', provider_message_id='key:old', first_attempt_at=now()-interval '31 minutes', attempt_count=1 WHERE campaign_id=$1 AND stage_day=7`, [cid]);
+  const sender = new FakeSender(async () => ({ outcome: 'accepted', providerMessageId: 'x' }));
+  sender.idempotentRetryMinutes = 30;
+  await consent(u.c, false); await consent(u.c, true); // revoke + re-grant around the unknown row
+  const st = (await w.adminDb.query(`SELECT state FROM followup_delivery WHERE campaign_id=$1 AND stage_day=7`, [cid])).rows[0].state;
+  assert.equal(st, 'unknown', 'uncertain provider outcome is preserved independent of consent state');
+  await sweepFollowups(w.runtime, sender);
+  assert.equal(sender.calls.length, 0, '31-min-old key: attempt is outside the original TTL: never resent');
+  assert.equal((await w.adminDb.query(`SELECT state FROM followup_delivery WHERE campaign_id=$1 AND stage_day=7`, [cid])).rows[0].state, 'unknown');
+});
+
+test('regression: a concurrent stop between claim and write is never overwritten', async () => {
+  const u = await mkUser('ro@example.in'); const issueId = await mkIssue(u.c);
+  await consent(u.c);
+  const cid = (await create(u.c, issueId, 'k-' + uniq(), 'ro@example.in')).json.campaign_id;
+  await isolate(cid, [7]);
+  const orig = w.runtime.query.bind(w.runtime);
+  (w.runtime as any).query = async (text: any, p?: any) => {
+    const r = await orig(text, p);
+    if (typeof text === 'string' && text.includes('FOR UPDATE OF d SKIP LOCKED')) {
+      // Revoke lands fully between the claim and the sweep's per-delivery transaction.
+      await w.adminDb.query(`UPDATE followup_campaign SET state='revoked' WHERE id=$1`, [cid]);
+      await w.adminDb.query(`UPDATE followup_delivery SET state='suppressed' WHERE campaign_id=$1`, [cid]);
+    }
+    return r;
+  };
+  try { await sweepFollowups(w.runtime, new NoProvider()); } finally { (w.runtime as any).query = orig; }
+  const row = (await w.adminDb.query(`SELECT state FROM followup_delivery WHERE campaign_id=$1 AND stage_day=7`, [cid])).rows[0];
+  assert.equal(row.state, 'suppressed', 'revoke suppression is never overwritten by the sweep');
+});
+
+test('regression: consent revoked after claim but before send blocks the send, and re-grant does not resurrect it', async () => {
+  const u = await mkUser('rt@example.in'); const issueId = await mkIssue(u.c);
+  await consent(u.c);
+  const cid = (await create(u.c, issueId, 'k-' + uniq(), 'rt@example.in')).json.campaign_id;
+  await isolate(cid, [7]);
+  const sender = new FakeSender(async () => ({ outcome: 'accepted', providerMessageId: 'x' }));
+  const orig = w.runtime.query.bind(w.runtime);
+  (w.runtime as any).query = async (text: any, p?: any) => {
+    const r = await orig(text, p);
+    if (typeof text === 'string' && text.includes('FOR UPDATE OF d SKIP LOCKED')) await consent(u.c, false);
+    return r;
+  };
+  try { await sweepFollowups(w.runtime, sender); } finally { (w.runtime as any).query = orig; }
+  assert.equal(sender.calls.length, 0, 'committed revoke is always seen before the send decision');
+  assert.equal((await w.adminDb.query(`SELECT state FROM followup_delivery WHERE campaign_id=$1 AND stage_day=7`, [cid])).rows[0].state, 'blocked_no_consent');
+});
+
+test('regression: unverified email claims are rejected; only issuer-verified email binds', async () => {
+  const mk = async (extra: Record<string, unknown>) => client(w, await sign('uv-' + uniq(), { extra }));
+  const unverified = await mk({ email: 'u@example.in', email_verified: false });
+  const i1 = await mkIssue(unverified);
+  await consent(unverified);
+  assert.equal((await create(unverified, i1, 'k-' + uniq(), 'u@example.in')).status, 400); // signin_email_unavailable
+  const noFlag = await mk({ email: 'n@example.in' }); // claim present, verification unknown
+  const i2 = await mkIssue(noFlag);
+  await consent(noFlag);
+  assert.equal((await create(noFlag, i2, 'k-' + uniq(), 'n@example.in')).status, 400);
+  const metaFlag = await mk({ email: 'm@example.in', user_metadata: { email_verified: true } }); // issuer marker in user_metadata
+  const i3 = await mkIssue(metaFlag);
+  await consent(metaFlag);
+  assert.equal((await create(metaFlag, i3, 'k-' + uniq(), 'm@example.in')).status, 201);
+});
+
+test('regression: identical HTML replay returns 200 same campaign; canonical hash beats jsonb key order', async () => {
+  const u = await mkUser('rh@example.in'); const issueId = await mkIssue(u.c);
+  await consent(u.c);
+  const withHtml = STAGES.map((s) => ({ ...s, body_html: `<p>${s.body_text}</p>` }));
+  const key = 'k-' + uniq();
+  const h1 = await create(u.c, issueId, key, 'rh@example.in', withHtml);
+  assert.equal(h1.status, 201);
+  const h2 = await create(u.c, issueId, key, 'rh@example.in', withHtml); // byte-identical replay
+  assert.equal(h2.status, 200);
+  assert.equal(h2.json.campaign_id, h1.json.campaign_id);
+  assert.equal(h2.json.replayed, true);
+  const changed = await create(u.c, issueId, key, 'rh@example.in', withHtml.map((s) => ({ ...s, body_html: s.body_html + 'x' })));
+  assert.equal(changed.status, 409); // same key, different payload
+});
+
+test('regression: an older consent version no longer satisfies create or sweep after a bump', async () => {
+  const u = await mkUser('rv2@example.in'); const issueId = await mkIssue(u.c);
+  await consent(u.c);
+  // Simulate a text bump: stored grant is now stale relative to FOLLOWUP_CONSENT_VERSION
+  await w.adminDb.query(`UPDATE user_mail_consent SET scope_version='v0-stale' WHERE user_id=(SELECT id FROM users WHERE subject LIKE 'u-%' ORDER BY created_at DESC LIMIT 1)`);
+  assert.equal((await create(u.c, issueId, 'k-' + uniq(), 'rv2@example.in')).status, 403); // consent_version_changed
+  // An existing campaign's deliveries also block honestly instead of honoring the old grant
+  await consent(u.c); // re-grant at current version
+  const cid = (await create(u.c, issueId, 'k-' + uniq(), 'rv2@example.in')).json.campaign_id;
+  await isolate(cid, [7]);
+  await w.adminDb.query(`UPDATE user_mail_consent SET scope_version='v0-stale' WHERE granted=true`);
+  const sender = new FakeSender(async () => ({ outcome: 'accepted', providerMessageId: 'x' }));
+  await sweepFollowups(w.runtime, sender);
+  assert.equal(sender.calls.length, 0);
+  const row = (await w.adminDb.query(`SELECT state, last_error FROM followup_delivery WHERE campaign_id=$1 AND stage_day=7`, [cid])).rows[0];
+  assert.equal(row.state, 'blocked_no_consent');
+  assert.equal(row.last_error, 'consent_version_changed');
 });
