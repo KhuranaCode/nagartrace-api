@@ -1,0 +1,6 @@
+# Local dev only (UNTESTED here). Synthetic data only.
+services:
+  db:
+    image: postgis/postgis:16-3.4
+    environment: { POSTGRES_PASSWORD: dev, POSTGRES_DB: nagartrace }
+    ports: ["55432:5432"]

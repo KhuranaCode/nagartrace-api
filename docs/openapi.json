@@ -1,0 +1,1230 @@
+{
+ "openapi": "3.0.3",
+ "info": {
+  "title": "NagarTrace API (DRAFT, provisional policies)",
+  "version": "0.2-draft",
+  "description": "Draft for the team to agree; not final. Hidden records return 404. Errors: {error,message}."
+ },
+ "components": {
+  "securitySchemes": {
+   "bearer": {
+    "type": "http",
+    "scheme": "bearer",
+    "bearerFormat": "JWT"
+   }
+  }
+ },
+ "paths": {
+  "/health": {
+   "get": {
+    "summary": "Health, policy state, verification_mode",
+    "security": [],
+    "responses": {
+     "200": {
+      "description": "OK"
+     },
+     "4XX": {
+      "description": "{error,message}; hidden records return 404"
+     }
+    }
+   }
+  },
+  "/v1/me": {
+   "get": {
+    "summary": "Current user (creates citizen on first call)",
+    "security": [
+     {
+      "bearer": []
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     },
+     "4XX": {
+      "description": "{error,message}; hidden records return 404"
+     }
+    }
+   },
+   "patch": {
+    "summary": "Update alias/ward",
+    "security": [
+     {
+      "bearer": []
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     },
+     "4XX": {
+      "description": "{error,message}; hidden records return 404"
+     }
+    },
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [],
+        "properties": {
+         "alias": {
+          "type": "string"
+         },
+         "ward": {
+          "type": "string"
+         }
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/v1/me/badges": {
+   "get": {
+    "summary": "Derived badges",
+    "security": [
+     {
+      "bearer": []
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     },
+     "4XX": {
+      "description": "{error,message}; hidden records return 404"
+     }
+    }
+   }
+  },
+  "/v1/reports": {
+   "post": {
+    "summary": "Submit report (Idempotency-Key header optional). Status stays 'reported' in officer_review mode",
+    "security": [
+     {
+      "bearer": []
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     },
+     "4XX": {
+      "description": "{error,message}; hidden records return 404"
+     }
+    },
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+         "lat",
+         "lon",
+         "hazard",
+         "captured_at"
+        ],
+        "properties": {
+         "lat": {
+          "type": "number"
+         },
+         "lon": {
+          "type": "number"
+         },
+         "accuracy_m": {
+          "type": "number"
+         },
+         "hazard": {
+          "type": "string",
+          "enum": [
+           "pothole",
+           "crack",
+           "waterlogging",
+           "broken_edge",
+           "missing_cover",
+           "other"
+          ]
+         },
+         "danger": {
+          "type": "boolean"
+         },
+         "note": {
+          "type": "string",
+          "maxLength": 500
+         },
+         "captured_at": {
+          "type": "string",
+          "format": "date-time"
+         }
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/v1/issues": {
+   "get": {
+    "summary": "List own/organisation issues",
+    "security": [
+     {
+      "bearer": []
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     },
+     "4XX": {
+      "description": "{error,message}; hidden records return 404"
+     }
+    },
+    "parameters": [
+     {
+      "name": "responsible",
+      "in": "query",
+      "required": false,
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "name": "status",
+      "in": "query",
+      "required": false,
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "required": false,
+      "schema": {
+       "type": "integer"
+      }
+     }
+    ]
+   }
+  },
+  "/v1/issues/{id}": {
+   "get": {
+    "summary": "Issue with events and evidence metadata",
+    "security": [
+     {
+      "bearer": []
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     },
+     "4XX": {
+      "description": "{error,message}; hidden records return 404"
+     }
+    },
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string",
+       "format": "uuid"
+      }
+     }
+    ]
+   }
+  },
+  "/v1/public/issues": {
+   "get": {
+    "summary": "Public safe list",
+    "security": [],
+    "responses": {
+     "200": {
+      "description": "OK"
+     },
+     "4XX": {
+      "description": "{error,message}; hidden records return 404"
+     }
+    },
+    "parameters": [
+     {
+      "name": "responsible",
+      "in": "query",
+      "required": false,
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "name": "status",
+      "in": "query",
+      "required": false,
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "name": "ward",
+      "in": "query",
+      "required": false,
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "required": false,
+      "schema": {
+       "type": "string"
+      }
+     }
+    ]
+   }
+  },
+  "/v1/public/issues/{id}": {
+   "get": {
+    "summary": "Public safe issue",
+    "security": [],
+    "responses": {
+     "200": {
+      "description": "OK"
+     },
+     "4XX": {
+      "description": "{error,message}; hidden records return 404"
+     }
+    },
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string",
+       "format": "uuid"
+      }
+     }
+    ]
+   }
+  },
+  "/v1/public/scorecards": {
+   "get": {
+    "summary": "Public scorecards (404 until enabled)",
+    "security": [],
+    "responses": {
+     "200": {
+      "description": "OK"
+     },
+     "4XX": {
+      "description": "{error,message}; hidden records return 404"
+     }
+    }
+   }
+  },
+  "/v1/leaderboard": {
+   "get": {
+    "summary": "Leaderboard",
+    "security": [
+     {
+      "bearer": []
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     },
+     "4XX": {
+      "description": "{error,message}; hidden records return 404"
+     }
+    },
+    "parameters": [
+     {
+      "name": "ward",
+      "in": "query",
+      "required": false,
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "name": "period",
+      "in": "query",
+      "required": false,
+      "schema": {
+       "type": "string"
+      }
+     }
+    ]
+   }
+  },
+  "/v1/issues/{id}/evidence": {
+   "post": {
+    "summary": "Upload image bytes (jpeg/png/webp, 8MB)",
+    "security": [
+     {
+      "bearer": []
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     },
+     "4XX": {
+      "description": "{error,message}; hidden records return 404"
+     }
+    },
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string",
+       "format": "uuid"
+      }
+     },
+     {
+      "name": "kind",
+      "in": "query",
+      "required": true,
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "name": "lat",
+      "in": "query",
+      "required": true,
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "name": "lon",
+      "in": "query",
+      "required": true,
+      "schema": {
+       "type": "string"
+      }
+     }
+    ]
+   }
+  },
+  "/v1/issues/{id}/evidence/{eid}": {
+   "get": {
+    "summary": "Download evidence image (participants only)",
+    "security": [
+     {
+      "bearer": []
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     },
+     "4XX": {
+      "description": "{error,message}; hidden records return 404"
+     }
+    },
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string",
+       "format": "uuid"
+      }
+     },
+     {
+      "name": "eid",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string",
+       "format": "uuid"
+      }
+     }
+    ]
+   }
+  },
+  "/v1/issues/{id}/verify": {
+   "post": {
+    "summary": "Verify or reject a 'reported' issue (provisional policy)",
+    "security": [
+     {
+      "bearer": []
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     },
+     "4XX": {
+      "description": "{error,message}; hidden records return 404"
+     }
+    },
+    "description": "Roles: municipal officer/admin of review org",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+         "decision",
+         "reason"
+        ],
+        "properties": {
+         "decision": {
+          "enum": [
+           "verify",
+           "reject"
+          ]
+         },
+         "reason": {
+          "type": "string",
+          "minLength": 10,
+          "maxLength": 500
+         }
+        }
+       }
+      }
+     }
+    },
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string",
+       "format": "uuid"
+      }
+     }
+    ]
+   }
+  },
+  "/v1/issues/{id}/accept": {
+   "post": {
+    "summary": "Assignee acknowledges",
+    "security": [
+     {
+      "bearer": []
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     },
+     "4XX": {
+      "description": "{error,message}; hidden records return 404"
+     }
+    },
+    "description": "Roles: assigned org",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string",
+       "format": "uuid"
+      }
+     }
+    ]
+   }
+  },
+  "/v1/issues/{id}/start": {
+   "post": {
+    "summary": "Start repair",
+    "security": [
+     {
+      "bearer": []
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     },
+     "4XX": {
+      "description": "{error,message}; hidden records return 404"
+     }
+    },
+    "description": "Roles: assigned org",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string",
+       "format": "uuid"
+      }
+     }
+    ]
+   }
+  },
+  "/v1/issues/{id}/submit-repair": {
+   "post": {
+    "summary": "Submit repair proof",
+    "security": [
+     {
+      "bearer": []
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     },
+     "4XX": {
+      "description": "{error,message}; hidden records return 404"
+     }
+    },
+    "description": "Roles: assigned org",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+         "evidence_id"
+        ],
+        "properties": {
+         "evidence_id": {
+          "type": "string",
+          "format": "uuid"
+         }
+        }
+       }
+      }
+     }
+    },
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string",
+       "format": "uuid"
+      }
+     }
+    ]
+   }
+  },
+  "/v1/issues/{id}/confirm": {
+   "post": {
+    "summary": "Citizen confirms fixed or not",
+    "security": [
+     {
+      "bearer": []
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     },
+     "4XX": {
+      "description": "{error,message}; hidden records return 404"
+     }
+    },
+    "description": "Roles: reporters",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+         "is_fixed"
+        ],
+        "properties": {
+         "is_fixed": {
+          "type": "boolean"
+         }
+        }
+       }
+      }
+     }
+    },
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string",
+       "format": "uuid"
+      }
+     }
+    ]
+   }
+  },
+  "/v1/issues/{id}/municipal-decision": {
+   "post": {
+    "summary": "Approve/reject repair",
+    "security": [
+     {
+      "bearer": []
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     },
+     "4XX": {
+      "description": "{error,message}; hidden records return 404"
+     }
+    },
+    "description": "Roles: municipal officer/admin",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+         "decision",
+         "reason"
+        ],
+        "properties": {
+         "decision": {
+          "enum": [
+           "approve",
+           "reject"
+          ]
+         },
+         "reason": {
+          "type": "string",
+          "minLength": 10,
+          "maxLength": 500
+         }
+        }
+       }
+      }
+     }
+    },
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string",
+       "format": "uuid"
+      }
+     }
+    ]
+   }
+  },
+  "/v1/issues/{id}/override-route": {
+   "post": {
+    "summary": "Override responsible org",
+    "security": [
+     {
+      "bearer": []
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     },
+     "4XX": {
+      "description": "{error,message}; hidden records return 404"
+     }
+    },
+    "description": "Roles: municipal officer/admin",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+         "org_id",
+         "reason"
+        ],
+        "properties": {
+         "org_id": {
+          "type": "string",
+          "format": "uuid"
+         },
+         "reason": {
+          "type": "string",
+          "minLength": 10,
+          "maxLength": 500
+         }
+        }
+       }
+      }
+     }
+    },
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string",
+       "format": "uuid"
+      }
+     }
+    ]
+   }
+  },
+  "/v1/issues/{id}/dispute": {
+   "post": {
+    "summary": "Raise dispute within 48h of assignment",
+    "security": [
+     {
+      "bearer": []
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     },
+     "4XX": {
+      "description": "{error,message}; hidden records return 404"
+     }
+    },
+    "description": "Roles: assigned org",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+         "reason"
+        ],
+        "properties": {
+         "reason": {
+          "type": "string",
+          "minLength": 10
+         },
+         "evidence_id": {
+          "type": "string",
+          "format": "uuid"
+         }
+        }
+       }
+      }
+     }
+    },
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string",
+       "format": "uuid"
+      }
+     }
+    ]
+   }
+  },
+  "/v1/disputes/{id}/decide": {
+   "post": {
+    "summary": "Decide dispute",
+    "security": [
+     {
+      "bearer": []
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     },
+     "4XX": {
+      "description": "{error,message}; hidden records return 404"
+     }
+    },
+    "description": "Roles: municipal officer/admin",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+         "decision",
+         "reason"
+        ],
+        "properties": {
+         "decision": {
+          "enum": [
+           "upheld",
+           "rejected"
+          ]
+         },
+         "reason": {
+          "type": "string",
+          "minLength": 10,
+          "maxLength": 500
+         }
+        }
+       }
+      }
+     }
+    },
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string",
+       "format": "uuid"
+      }
+     }
+    ]
+   }
+  },
+  "/v1/admin/orgs": {
+   "post": {
+    "summary": "Create org",
+    "security": [
+     {
+      "bearer": []
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     },
+     "4XX": {
+      "description": "{error,message}; hidden records return 404"
+     }
+    },
+    "description": "Roles: admin of that municipality. The org is owned by that municipality.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+         "kind",
+         "name",
+         "municipality_org_id"
+        ],
+        "properties": {
+         "kind": {
+          "enum": [
+           "contractor",
+           "utility"
+          ]
+         },
+         "name": {
+          "type": "string"
+         },
+         "is_synthetic": {
+          "type": "boolean"
+         },
+         "municipality_org_id": {
+          "type": "string",
+          "format": "uuid"
+         }
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/v1/admin/memberships": {
+   "post": {
+    "summary": "Add membership",
+    "security": [
+     {
+      "bearer": []
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     },
+     "4XX": {
+      "description": "{error,message}; hidden records return 404"
+     }
+    },
+    "description": "Roles: municipal admin. Contractor/utility roles only for orgs owned by the admin's own municipality.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+         "user_id",
+         "org_id",
+         "role"
+        ],
+        "properties": {
+         "user_id": {
+          "type": "string",
+          "format": "uuid"
+         },
+         "org_id": {
+          "type": "string",
+          "format": "uuid"
+         },
+         "role": {
+          "enum": [
+           "admin",
+           "officer",
+           "contractor",
+           "utility"
+          ]
+         }
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/v1/admin/registry/import": {
+   "post": {
+    "summary": "Import road registry (JSON)",
+    "security": [
+     {
+      "bearer": []
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     },
+     "4XX": {
+      "description": "{error,message}; hidden records return 404"
+     }
+    },
+    "description": "Roles: municipality admin"
+   }
+  },
+  "/v1/admin/registry/import-csv": {
+   "post": {
+    "summary": "Import road registry (CSV strings)",
+    "security": [
+     {
+      "bearer": []
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     },
+     "4XX": {
+      "description": "{error,message}; hidden records return 404"
+     }
+    },
+    "description": "Roles: municipality admin",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+         "municipality_org_id",
+         "source_label",
+         "is_synthetic",
+         "roads_csv"
+        ],
+        "properties": {
+         "municipality_org_id": {
+          "type": "string",
+          "format": "uuid"
+         },
+         "source_label": {
+          "type": "string"
+         },
+         "is_synthetic": {
+          "type": "boolean"
+         },
+         "roads_csv": {
+          "type": "string"
+         },
+         "contracts_csv": {
+          "type": "string"
+         },
+         "utility_cuts_csv": {
+          "type": "string"
+         }
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/v1/admin/jobs/escalate": {
+   "post": {
+    "summary": "Record overdue escalations (nothing is sent)",
+    "security": [
+     {
+      "bearer": []
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     },
+     "4XX": {
+      "description": "{error,message}; hidden records return 404"
+     }
+    },
+    "description": "Roles: admin"
+   }
+  },
+  "/v1/admin/scorecards": {
+   "get": {
+    "summary": "Scorecards (not public)",
+    "security": [
+     {
+      "bearer": []
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     },
+     "4XX": {
+      "description": "{error,message}; hidden records return 404"
+     }
+    },
+    "description": "Roles: admin/officer"
+   }
+  },
+  "/v1/admin/memberships/revoke": {
+   "post": {
+    "summary": "Revoke a membership (soft; history kept)",
+    "security": [
+     {
+      "bearer": []
+     }
+    ],
+    "description": "Roles: admin of the owning municipality. Cannot revoke own municipal role.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+         "user_id",
+         "org_id",
+         "role"
+        ],
+        "properties": {
+         "user_id": {
+          "type": "string",
+          "format": "uuid"
+         },
+         "org_id": {
+          "type": "string",
+          "format": "uuid"
+         },
+         "role": {
+          "enum": [
+           "admin",
+           "officer",
+           "contractor",
+           "utility"
+          ]
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "200": {
+      "description": "OK"
+     },
+     "4XX": {
+      "description": "{error,message}"
+     }
+    }
+   }
+  },
+  "/v1/issues/{id}/claim-review": {
+   "post": {
+    "summary": "Claim an unrouted pending report for review (policy OPEN)",
+    "security": [
+     {
+      "bearer": []
+     }
+    ],
+    "description": "Disabled by default (POLICY_UNROUTED_TRIAGE=off => 404). When enabled (any_municipal_staff, synthetic-demo/provisional): municipal officer/admin, only while status=reported and no review municipality. Assigns nothing.",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string",
+       "format": "uuid"
+      }
+     }
+    ],
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+         "reason"
+        ],
+        "properties": {
+         "org_id": {
+          "type": "string",
+          "format": "uuid"
+         },
+         "reason": {
+          "type": "string",
+          "minLength": 10
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "200": {
+      "description": "OK"
+     },
+     "4XX": {
+      "description": "{error,message}"
+     }
+    }
+   }
+  }
+ }
+}
