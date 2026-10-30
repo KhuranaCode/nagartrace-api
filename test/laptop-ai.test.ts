@@ -76,13 +76,16 @@ test('budgets: 2 in flight max, done() releases, 5 per user per window', () => {
 test('output validation: strict enum, no invented hazards, bounded fields', () => {
   const good = parseAdvisory(JSON.stringify({ summary: 'Deep pothole at the junction.', severity_hint: 'high', suggested_hazard: 'pothole', missing_details: ['exact lane'] }), 'm');
   assert.equal(good.advisory, true); assert.equal(good.severity_hint, 'high'); assert.equal(good.suggested_hazard, 'pothole');
-  assert.throws(() => parseAdvisory(JSON.stringify({ summary: 'x', severity_hint: 'catastrophic' }), 'm'), LaptopAiError); // invalid enum rejects, never silent
-  assert.throws(() => parseAdvisory(JSON.stringify({ summary: '' }), 'm'), LaptopAiError);
+  // STRICT: every schema violation rejects the whole reply - no partial normalization.
+  assert.throws(() => parseAdvisory(JSON.stringify({ summary: 'x', severity_hint: 'catastrophic', suggested_hazard: null, missing_details: [] }), 'm'), LaptopAiError);
+  assert.throws(() => parseAdvisory(JSON.stringify({ summary: 'x', suggested_hazard: null, missing_details: [] }), 'm'), LaptopAiError); // severity missing
+  assert.throws(() => parseAdvisory(JSON.stringify({ summary: '', severity_hint: 'low', suggested_hazard: null, missing_details: [] }), 'm'), LaptopAiError);
   assert.throws(() => parseAdvisory('not json', 'm'), LaptopAiError);
-  assert.throws(() => parseAdvisory(JSON.stringify({ summary: 'x', missing_details: 'lots' }), 'm'), LaptopAiError);
-  assert.throws(() => parseAdvisory(JSON.stringify({ summary: 'x', missing_details: ['y'.repeat(200)] }), 'm'), LaptopAiError);
-  const invented = parseAdvisory(JSON.stringify({ summary: 'x', suggested_hazard: 'alien_base' }), 'm');
-  assert.equal(invented.suggested_hazard, null); // invented labels dropped
-  const nullish = parseAdvisory(JSON.stringify({ summary: 'x', severity_hint: null }), 'm');
-  assert.equal(nullish.severity_hint, null); // explicit null stays null
+  assert.throws(() => parseAdvisory(JSON.stringify({ summary: 'x', severity_hint: 'low', suggested_hazard: null, missing_details: 'lots' }), 'm'), LaptopAiError);
+  assert.throws(() => parseAdvisory(JSON.stringify({ summary: 'x', severity_hint: 'low', suggested_hazard: null }), 'm'), LaptopAiError); // details missing
+  assert.throws(() => parseAdvisory(JSON.stringify({ summary: 'x', severity_hint: 'low', suggested_hazard: null, missing_details: ['y'.repeat(200)] }), 'm'), LaptopAiError);
+  assert.throws(() => parseAdvisory(JSON.stringify({ summary: 'x', severity_hint: 'low', suggested_hazard: null, missing_details: ['a','b','c','d','e','f'] }), 'm'), LaptopAiError); // >5 rejects, no truncation
+  assert.throws(() => parseAdvisory(JSON.stringify({ summary: 'x', severity_hint: 'low', suggested_hazard: 'alien_base', missing_details: [] }), 'm'), LaptopAiError); // invented hazard rejects
+  const nullish = parseAdvisory(JSON.stringify({ summary: 'x', severity_hint: null, suggested_hazard: null, missing_details: [] }), 'm');
+  assert.equal(nullish.severity_hint, null); // explicit null is in-contract
 });

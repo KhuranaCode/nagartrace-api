@@ -50,8 +50,13 @@ export function validateLaptopAiConfig(cfg: LaptopAiConfig): { ok: true; base: s
   if (u.username || u.password) return { ok: false, reason: 'misconfigured' };
   if (u.search || u.hash) return { ok: false, reason: 'misconfigured' };
   const host = u.hostname.toLowerCase();
-  if (host === 'localhost' || host === '127.0.0.1' || host === '::1' || host.endsWith('.local')) return { ok: false, reason: 'misconfigured' };
-  if (/^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(host)) return { ok: false, reason: 'misconfigured' }; // literal private IPs
+  // Destination policy: a named gateway host ONLY - every IP literal (v4 or v6, any range:
+  // loopback, private, link-local, ULA) is rejected in one rule, plus localhost-style names
+  // and the default raw Ollama port. The configured URL host itself is the allowlist: it must
+  // be the deliberate, verified gateway. DNS resolution/rebinding stays a documented
+  // gateway-config concern, not something string checks can solve here.
+  if (host === 'localhost' || host.endsWith('.local') || host.endsWith('.internal')) return { ok: false, reason: 'misconfigured' };
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host) || host.includes(':')) return { ok: false, reason: 'misconfigured' }; // any IP literal
   if (u.port === '11434') return { ok: false, reason: 'misconfigured' }; // default raw Ollama port
   if (!cfg.token) return { ok: false, reason: 'misconfigured' }; // gateway secret required
   if (!cfg.model) return { ok: false, reason: 'misconfigured' };
@@ -174,27 +179,29 @@ export function parseAdvisory(raw: string, model: string): Advisory {
   if (typeof parsed?.summary !== 'string' || parsed.summary.trim().length === 0 || parsed.summary.length > 500) {
     throw new LaptopAiError('bad_output', 'model reply missing/bad summary');
   }
+  // STRICT contract: every field must be present and in-schema. Violations reject the whole
+  // reply as bad_output - there is no partial normalization path.
   const sev = parsed.severity_hint;
-  if (sev !== undefined && sev !== null && sev !== 'low' && sev !== 'medium' && sev !== 'high') {
-    throw new LaptopAiError('bad_output', 'severity_hint outside the allowed enum');
+  if (sev === undefined || (sev !== null && sev !== 'low' && sev !== 'medium' && sev !== 'high')) {
+    throw new LaptopAiError('bad_output', 'severity_hint missing or outside the allowed enum');
   }
-  // suggested_hazard passes through ONLY as a known hazard key; invented labels are dropped.
+  if (!('suggested_hazard' in parsed)) throw new LaptopAiError('bad_output', 'suggested_hazard missing');
   let hazard: string | null = null;
-  if (typeof parsed.suggested_hazard === 'string') {
+  if (parsed.suggested_hazard !== null) {
+    if (typeof parsed.suggested_hazard !== 'string') throw new LaptopAiError('bad_output', 'suggested_hazard not a string/null');
     const h = parsed.suggested_hazard.trim().toLowerCase();
-    if (HAZARD_KEYS.includes(h)) hazard = h;
+    if (!HAZARD_KEYS.includes(h)) throw new LaptopAiError('bad_output', 'suggested_hazard outside known hazard keys');
+    hazard = h;
   }
-  if (parsed.missing_details !== undefined && !Array.isArray(parsed.missing_details)) {
-    throw new LaptopAiError('bad_output', 'missing_details was not an array');
-  }
-  const rawMissing: any[] = parsed.missing_details ?? [];
-  if (rawMissing.some((x) => typeof x !== 'string' || x.length === 0 || x.length > 120)) {
+  if (!Array.isArray(parsed.missing_details)) throw new LaptopAiError('bad_output', 'missing_details missing/not an array');
+  if (parsed.missing_details.length > 5) throw new LaptopAiError('bad_output', 'missing_details over 5 items');
+  if (parsed.missing_details.some((x: any) => typeof x !== 'string' || x.length === 0 || x.length > 120)) {
     throw new LaptopAiError('bad_output', 'missing_details item outside bounds');
   }
-  const missing = rawMissing.slice(0, 5);
+  const missing: string[] = parsed.missing_details;
   return {
     summary: parsed.summary.trim(),
-    severity_hint: sev ?? null,
+    severity_hint: sev,
     suggested_hazard: hazard,
     missing_details: missing,
     model,
