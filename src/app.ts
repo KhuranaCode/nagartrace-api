@@ -5,6 +5,7 @@ import type pg from 'pg';
 import type { Config } from './config.ts';
 import { authenticate, HttpError, memberships, type KeyResolver, type Membership, type Principal } from './auth.ts';
 import { awardPoints, deadlineHours, lockIssue, recordEvent, routeIssue, runEscalations, severityOf, transition } from './domain.ts';
+import { registerStreakRoutes } from './streaks.ts';
 import { normalizeImage } from './images.ts';
 import type { BlobStore } from './storage.ts';
 
@@ -562,6 +563,8 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
     if (!ms.some((m) => (m.role === 'admin' || m.role === 'officer') && m.kind === 'municipality')) throw new HttpError(403, 'Municipal staff only', 'forbidden');
     return { scorecards: await scorecards(db, !!(await db.query('SELECT is_test FROM users WHERE id=$1', [p.userId])).rows[0]?.is_test), note: 'Counts only issues with no open dispute (PRD). Not public until legal review.' };
   });
+
+  registerStreakRoutes(app, { cfg, db, keys });
 
   return app;
 }
