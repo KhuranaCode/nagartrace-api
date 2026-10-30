@@ -2,7 +2,7 @@ import { jwtVerify, type JWTVerifyGetKey } from 'jose';
 import type pg from 'pg';
 import type { Config } from './config.ts';
 
-export type Principal = { userId: string; issuer: string; subject: string; suspended: boolean; ageHours: number };
+export type Principal = { userId: string; issuer: string; subject: string; suspended: boolean; ageHours: number; /** Sign-in email claim from the verified token, when the issuer includes one (Supabase does). Used ONLY to bind self-addressed mail; never trusted from a request body. */ email?: string };
 export type KeyResolver = JWTVerifyGetKey | CryptoKey | Uint8Array;
 
 export class HttpError extends Error {
@@ -13,13 +13,14 @@ export class HttpError extends Error {
 export async function authenticate(header: string | undefined, cfg: Config, keys: KeyResolver, db: pg.Pool): Promise<Principal> {
   if (!header?.startsWith('Bearer ')) throw new HttpError(401, 'Missing bearer token', 'unauthenticated');
   const token = header.slice(7).trim();
-  let sub: string, iss: string;
+  let sub: string, iss: string, email: string | undefined;
   try {
     const { payload } = await jwtVerify(token, keys as JWTVerifyGetKey, {
       issuer: cfg.authIssuer, audience: cfg.authAudience, algorithms: ['RS256', 'ES256'], requiredClaims: ['sub', 'exp', 'iss', 'aud'],
     });
     if (typeof payload.sub !== 'string' || !payload.sub || payload.sub.length > 255) throw new Error('bad sub');
     sub = payload.sub; iss = String(payload.iss);
+    if (typeof payload.email === 'string' && payload.email.length <= 320) email = payload.email;
   } catch {
     throw new HttpError(401, 'Invalid token', 'unauthenticated');
   }
@@ -28,7 +29,7 @@ export async function authenticate(header: string | undefined, cfg: Config, keys
   const r = await db.query(`SELECT id, suspended, EXTRACT(EPOCH FROM (now() - created_at))/3600 AS age_h FROM users WHERE issuer=$1 AND subject=$2`, [iss, sub]);
   const u = r.rows[0];
   if (u.suspended) throw new HttpError(403, 'Account suspended', 'suspended');
-  return { userId: u.id, issuer: iss, subject: sub, suspended: false, ageHours: Number(u.age_h) };
+  return { userId: u.id, issuer: iss, subject: sub, suspended: false, ageHours: Number(u.age_h), email };
 }
 
 export type Membership = { org_id: string; role: 'admin' | 'officer' | 'contractor' | 'utility'; kind: string; synthetic: boolean };

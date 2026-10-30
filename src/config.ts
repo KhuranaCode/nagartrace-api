@@ -30,9 +30,6 @@ export type Config = {
   rateLimitMax: number;
   /** Follow-up reminder pipeline routes + sweep job. Default OFF; the deployment owner flips FOLLOWUP_PIPELINE=true AFTER migration 011 is applied (coordinated). When off, the routes return 404 and clients show the static honest fallback. */
   followupPipeline: boolean;
-  /** Transactional provider credentials. Absent = NoProvider: every send resolves to the truthful blocked_no_provider state; nothing is ever claimed sent. */
-  brevoApiKey?: string;
-  brevoFrom?: string;
 };
 
 export function defaults(): Omit<Config, 'authIssuer' | 'authAudience' | 'databaseUrl'> {
@@ -103,7 +100,5 @@ export function fromEnv(env = process.env): Config {
     publicScorecards: env.PUBLIC_SCORECARDS === 'true',
     photoRequired: env.PHOTO_REQUIRED === 'true',
     followupPipeline: env.FOLLOWUP_PIPELINE === 'true',
-    brevoApiKey: env.BREVO_API_KEY,
-    brevoFrom: env.BREVO_FROM,
   } as Config;
 }

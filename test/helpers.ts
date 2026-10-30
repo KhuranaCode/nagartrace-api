@@ -46,7 +46,7 @@ export function client(w: World, token: string) {
     let json: any = null; try { json = r.json(); } catch { /* binary */ }
     return { status: r.statusCode, json, raw: r.rawPayload, headers: r.headers };
   };
-  return { get: (u: string) => call('GET', u), post: (u: string, b?: unknown, h?: Record<string, string>) => call('POST', u, b ?? {}, h), patch: (u: string, b: unknown) => call('PATCH', u, b), upload: (u: string, img: Buffer, type = 'image/jpeg') => call('POST', u, img, { 'content-type': type }) };
+  return { get: (u: string) => call('GET', u), post: (u: string, b?: unknown, h?: Record<string, string>) => call('POST', u, b ?? {}, h), patch: (u: string, b: unknown) => call('PATCH', u, b), delete: (u: string) => call('DELETE', u), upload: (u: string, img: Buffer, type = 'image/jpeg') => call('POST', u, img, { 'content-type': type }) };
 }
 export async function userToken(sub: string) { return sign(sub); }
 export async function jpeg(withExif = false) {
