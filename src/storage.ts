@@ -31,8 +31,7 @@ export type S3Opts = { endpoint: string; region: string; bucket: string; accessK
 const hmac = (k: Buffer | string, d: string) => crypto.createHmac('sha256', k).update(d).digest();
 const sha = (d: Buffer | string) => crypto.createHash('sha256').update(d).digest('hex');
 
-/** S3-compatible private store (path-style, AWS SigV4). Unverified against a real provider:
- *  only tested with a mock. Objects are never public; reads go through the API's authorization. */
+/** S3-compatible private store (path-style, AWS SigV4). Verified once against Supabase Storage (S3 endpoint with a /storage/v1/s3 path prefix); also mock-tested. Objects are never public; reads go through the API's authorization. */
 export function s3Store(o: S3Opts): BlobStore {
   const f = o.fetchFn ?? fetch;
   const base = new URL(o.endpoint);
@@ -40,7 +39,8 @@ export function s3Store(o: S3Opts): BlobStore {
     const t = (o.now ?? (() => new Date()))();
     const amz = t.toISOString().replace(/[:-]|\.\d{3}/g, '');
     const day = amz.slice(0, 8);
-    const p = `/${o.bucket}/${key}`;
+    const prefix = base.pathname.replace(/\/+$/, '');
+    const p = `${prefix}/${o.bucket}/${key}`;
     const payload = sha(body);
     const headers: Record<string, string> = { host: base.host, 'x-amz-content-sha256': payload, 'x-amz-date': amz };
     const names = Object.keys(headers).sort();

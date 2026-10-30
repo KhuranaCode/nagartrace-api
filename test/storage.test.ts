@@ -19,3 +19,11 @@ test('s3 store (mock only): signed private PUT/GET, key validation, errors', asy
   await assert.rejects(s.get('../etc/passwd'));
   await assert.rejects(s.get('a'.repeat(32)));
 });
+
+test('s3 store: endpoint path prefix (e.g. /storage/v1/s3) is part of the signed and requested path', async () => {
+  const urls: string[] = [];
+  const fetchFn = (async (url: string, init: any) => { urls.push(url); return init.method === 'PUT' ? new Response(null, { status: 200 }) : new Response(new Uint8Array([1])); }) as any;
+  const s = s3Store({ endpoint: 'https://p.example.test/storage/v1/s3/', region: 'r', bucket: 'nt', accessKeyId: 'AK', secretAccessKey: 'SK', fetchFn });
+  const key = await s.put(Buffer.from('x'));
+  assert.equal(urls[0], `https://p.example.test/storage/v1/s3/nt/${key}`);
+});

@@ -18,7 +18,7 @@ Photo-less report with GPS/time checks; duplicate merge (30 m); routing order (r
 | Offline queue (P1) | Client-side; API has idempotency keys to support it. |
 | Hotspot analytics, photo hazard suggestion (P2) | Not built. |
 | Face / number-plate blur | No evaluated mechanism. Photos stay private. |
-| Object storage | Local disk, plus S3 adapter (SigV4) tested against a mock only; never run on a real store. |
+| Object storage | Local disk, plus S3 adapter (SigV4). Mock-tested, and one upload/read/denial run against Supabase Storage (private bucket) on synthetic data. Supabase S3 access keys are project-wide (all buckets, bypass RLS), so keep them server-only. |
 | Per-contract configurable warranty/deadline (open question) | Not built; deadlines are global config. |
 | Municipality can change deadlines | Not built. |
 | Hosting, hosted auth, backups, monitoring | Not done. |
