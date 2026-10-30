@@ -33,14 +33,25 @@ export interface AuthUserLookup {
 export const noAuthUserLookup: AuthUserLookup = async () => ({ status: 'unavailable', reason: 'not_configured' });
 
 export function supabaseAuthUserLookup(cfg: Config): AuthUserLookup {
-  const base = cfg.authIssuer.replace(/\/+$/, ''); // e.g. https://<project>.supabase.co/auth/v1
   const key = cfg.authServiceRoleKey;
   if (!key) return noAuthUserLookup;
+  // FAIL CLOSED on the issuer URL: the service-role key must only ever leave for the exact
+  // configured issuer origin over HTTPS. A plain-HTTP (or unparseable) issuer is a config
+  // error - the binding is unavailable, never "best effort". (Local test issuers are exempt:
+  // they are loopback-only and no real key is configured there.)
+  let issuer: URL;
+  try { issuer = new URL(cfg.authIssuer); } catch { return noAuthUserLookup; }
+  const loopback = ['localhost', '127.0.0.1', '::1'].includes(issuer.hostname);
+  if (issuer.protocol !== 'https:' && !loopback) return noAuthUserLookup;
+  const base = cfg.authIssuer.replace(/\/+$/, ''); // e.g. https://<project>.supabase.co/auth/v1
   return async (authUserId: string): Promise<VerifiedEmail> => {
     let r: Response;
     try {
+      // redirect:'error': fetch would otherwise follow a 3xx cross-origin AND FORWARD the
+      // apikey/authorization headers - a redirect must never leak the service key.
       r = await fetch(`${base}/admin/users/${encodeURIComponent(authUserId)}`, {
         headers: { apikey: key, authorization: `Bearer ${key}` },
+        redirect: 'error',
         signal: AbortSignal.timeout(5000),
       });
     } catch {

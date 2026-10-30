@@ -77,3 +77,26 @@ test('route: stock-JWT user binds via server-confirmed record; unconfirmed/unava
     assert.equal(res.json.error, 'signin_email_unavailable');
   }
 });
+
+test('credential safety: plain-HTTP issuer fails closed; redirects are never followed with the key; timeout aborts', async () => {
+  // plain-HTTP issuer (non-loopback): no request may ever be made with the service key
+  const insecure = supabaseAuthUserLookup({ authIssuer: 'http://evil.example/auth/v1', authServiceRoleKey: 'fake-key' } as any);
+  assert.deepEqual(await insecure('uid-1'), { status: 'unavailable', reason: 'not_configured' });
+  const garbage = supabaseAuthUserLookup({ authIssuer: 'not a url', authServiceRoleKey: 'fake-key' } as any);
+  assert.deepEqual(await garbage('uid-1'), { status: 'unavailable', reason: 'not_configured' });
+  // redirect handling: fetch must be called with redirect:'error' so a 3xx cannot carry the
+  // apikey/authorization headers cross-origin
+  const lk = supabaseAuthUserLookup({ authIssuer: 'https://issuer.test/', authServiceRoleKey: 'fake-key' } as any);
+  const realFetch = globalThis.fetch;
+  try {
+    let seenRedirect = ''; let seenSignal: unknown = null;
+    (globalThis as any).fetch = async (_url: any, init: any) => { seenRedirect = init.redirect; seenSignal = init.signal;
+      return new Response(null, { status: 301, headers: { location: 'https://evil.example/x' } }); };
+    assert.deepEqual(await lk('uid-1'), { status: 'unavailable', reason: 'lookup_failed' }); // 3xx is not ok, and with redirect:'error' it is never followed
+    assert.equal(seenRedirect, 'error');
+    assert.ok(seenSignal instanceof AbortSignal, 'timeout signal present');
+    // an aborted (timed-out) request fails closed too
+    (globalThis as any).fetch = async () => { const e = new Error('aborted'); (e as any).name = 'AbortError'; throw e; };
+    assert.deepEqual(await lk('uid-1'), { status: 'unavailable', reason: 'lookup_failed' });
+  } finally { (globalThis as any).fetch = realFetch; }
+});
