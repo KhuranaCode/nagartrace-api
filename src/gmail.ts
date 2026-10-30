@@ -35,13 +35,16 @@ export function decryptToken(key: Buffer, enc: Buffer): string {
   return Buffer.concat([d.update(enc.subarray(28)), d.final()]).toString('utf8');
 }
 
-/** Single-use OAuth state: HMAC over user|nonce|expiry|pkce-verifier, stateless but bound. */
-function signState(key: Buffer, userId: string, nonce: string, exp: number, verifier: string): string {
-  const payload = b64u(Buffer.from(JSON.stringify({ u: userId, n: nonce, e: exp, v: sha256(verifier) })));
+/** Single-use OAuth state: HMAC over user|nonce|expiry, stateless but user-bound. The PKCE
+ *  verifier is NEVER in here: the state is visible in the consent URL, so it carries no secret.
+ *  The verifier goes to the user's own client (TLS) and returns at callback; it is never
+ *  persisted server-side and never logged. */
+function signState(key: Buffer, userId: string, nonce: string, exp: number): string {
+  const payload = b64u(Buffer.from(JSON.stringify({ u: userId, n: nonce, e: exp })));
   const mac = createHmac('sha256', key).update(payload).digest();
   return payload + '.' + b64u(mac);
 }
-export function verifyState(key: Buffer, state: string, userId: string): { verifier: string } {
+export function verifyState(key: Buffer, state: string, userId: string): void {
   const i = state.lastIndexOf('.');
   const payload = i > 0 ? state.slice(0, i) : '';
   const mac = i > 0 ? state.slice(i + 1) : '';
@@ -51,7 +54,6 @@ export function verifyState(key: Buffer, state: string, userId: string): { verif
   let p: any;
   try { p = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')); } catch { throw new HttpError(403, 'Invalid OAuth state', 'bad_state'); }
   if (p.u !== userId || typeof p.e !== 'number' || p.e < Date.now()) throw new HttpError(403, 'OAuth state expired or not yours', 'bad_state');
-  return { verifier: p.v };
 }
 
 type OauthCfg = NonNullable<Config['gmailOAuth']>;
@@ -79,24 +81,26 @@ export function registerGmailRoutes(app: FastifyInstance, deps: { cfg: Config; d
     const o = oauth();
     const verifier = b64u(randomBytes(32));
     const challenge = b64u(createHash('sha256').update(verifier).digest());
-    const state = signState(tkey(), p.userId, randomUUID(), Date.now() + 10 * 60_000, verifier);
-    // The verifier is embedded ONLY inside the signed state (returned to THIS user's client,
-    // which hands both back at callback). It is never persisted server-side.
+    const state = signState(tkey(), p.userId, randomUUID(), Date.now() + 10 * 60_000);
     const url = 'https://accounts.google.com/o/oauth2/v2/auth?' + new URLSearchParams({
       client_id: o.clientId, redirect_uri: o.redirectUri, response_type: 'code',
       scope: 'openid email https://www.googleapis.com/auth/gmail.send',
       access_type: 'offline', prompt: 'consent', state,
       code_challenge: challenge, code_challenge_method: 'S256',
     }).toString();
-    return { consent_url: url, state };
+    // The verifier goes ONLY to this user's client; it comes back with the callback.
+    return { consent_url: url, state, code_verifier: verifier };
   });
 
   app.post('/v1/integrations/gmail/callback', async (req) => {
     const p = await auth(req);
     const o = oauth();
-    const { state, code } = (req.body ?? {}) as any;
+    const { state, code, code_verifier } = (req.body ?? {}) as any;
     if (typeof state !== 'string' || typeof code !== 'string' || !code) throw new HttpError(400, 'state and code required', 'validation');
-    const { verifier } = verifyState(tkey(), state, p.userId);
+    // RFC 7636 verifier shape; a wrong verifier fails at Google, never here with detail.
+    if (typeof code_verifier !== 'string' || !/^[A-Za-z0-9\-._~]{43,128}$/.test(code_verifier)) throw new HttpError(400, 'code_verifier required', 'validation');
+    verifyState(tkey(), state, p.userId);
+    const verifier = code_verifier;
     const tr = await fetchImpl('https://oauth2.googleapis.com/token', {
       method: 'POST', redirect: 'error', signal: AbortSignal.timeout(8000),
       headers: { 'content-type': 'application/x-www-form-urlencoded' },
@@ -150,10 +154,13 @@ export function registerGmailRoutes(app: FastifyInstance, deps: { cfg: Config; d
     const row = (await db.query(`SELECT google_sub, email, refresh_token_enc FROM gmail_connection WHERE user_id=$1 AND revoked_at IS NULL`, [userId])).rows[0];
     if (!row) return null;
     const o = cfg.gmailOAuth!;
+    let refreshToken: string;
+    try { refreshToken = decryptToken(tkey(), row.refresh_token_enc); }
+    catch { return null; } // key rotated/lost: fail closed as reconnect-required, never a 500
     const tr = await fetchImpl('https://oauth2.googleapis.com/token', {
       method: 'POST', redirect: 'error', signal: AbortSignal.timeout(8000),
       headers: { 'content-type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ client_id: o.clientId, client_secret: o.clientSecret, grant_type: 'refresh_token', refresh_token: decryptToken(tkey(), row.refresh_token_enc) }).toString(),
+      body: new URLSearchParams({ client_id: o.clientId, client_secret: o.clientSecret, grant_type: 'refresh_token', refresh_token: refreshToken }).toString(),
     });
     if (tr.status !== 200) return null;
     const j: any = await tr.json();
