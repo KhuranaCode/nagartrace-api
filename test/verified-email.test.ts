@@ -100,3 +100,20 @@ test('credential safety: plain-HTTP issuer fails closed; redirects are never fol
     assert.deepEqual(await lk('uid-1'), { status: 'unavailable', reason: 'lookup_failed' });
   } finally { (globalThis as any).fetch = realFetch; }
 });
+
+test('confirmation evidence: email_confirmed_at must be a real past/present timestamp; loopback HTTP also fails closed', async () => {
+  const lk = supabaseAuthUserLookup({ authIssuer: 'https://issuer.test/', authServiceRoleKey: 'fake-key' } as any);
+  const realFetch = globalThis.fetch;
+  const setFetch = (impl: any) => { (globalThis as any).fetch = impl; };
+  try {
+    for (const bad of [true, 12345, 'yes', 'not-a-date', '2999-01-01T00:00:00Z']) {
+      setFetch(async () => new Response(JSON.stringify({ id: 'uid-1', email: 'a@example.in', email_confirmed_at: bad }), { status: 200 }));
+      assert.deepEqual(await lk('uid-1'), { status: 'unavailable', reason: 'unconfirmed' }, JSON.stringify(bad));
+    }
+    setFetch(async () => new Response(JSON.stringify({ id: 'uid-1', email: 'a@example.in', email_confirmed_at: '2026-10-01T00:00:00Z' }), { status: 200 }));
+    assert.deepEqual(await lk('uid-1'), { status: 'verified', email: 'a@example.in' });
+  } finally { (globalThis as any).fetch = realFetch; }
+  // loopback plain HTTP is rejected too - a local redirect sink must never receive the key
+  const loopback = supabaseAuthUserLookup({ authIssuer: 'http://127.0.0.1:8000/auth/v1', authServiceRoleKey: 'fake-key' } as any);
+  assert.deepEqual(await loopback('uid-1'), { status: 'unavailable', reason: 'not_configured' });
+});
