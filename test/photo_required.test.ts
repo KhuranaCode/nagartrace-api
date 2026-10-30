@@ -256,6 +256,14 @@ test('photo-mandatory reports: stage + atomic bind, guards and failure modes', a
       }
     });
 
+    await t.test('staff accounts cannot stage report photos (citizen-only)', async () => {
+      // wOn is already seeded at suite start; officer-1 holds a municipal membership there
+      const officerClient = client(wOn, await userToken('officer-1'));
+      const r = await officerClient.upload(`/v1/uploads/stage?lat=${P_NOROAD.lat}&lon=${P_NOROAD.lon}`, await jpeg());
+      assert.equal(r.status, 403);
+      assert.equal(r.json.error, 'not_eligible');
+    });
+
     await t.test('bad image to stage is rejected like evidence uploads', async () => {
       const bad = await uOn.upload(`/v1/uploads/stage?lat=${P_NOROAD.lat}&lon=${P_NOROAD.lon}`, Buffer.from('not an image'));
       assert.equal(bad.status, 415);

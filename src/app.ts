@@ -321,6 +321,10 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
   // ---------- staged uploads (photo-mandatory reports) ----------
   app.post('/v1/uploads/stage', async (req, reply) => {
     const p = await auth(req);
+    // Citizen-only: staff accounts (any org membership) use staff flows and never
+    // stage citizen report photos. Mirrors the points/streaks accountability split.
+    if ((await memberships(db, p.userId)).length > 0)
+      throw new HttpError(403, 'Only citizen accounts can stage report photos', 'not_eligible');
     // Query strings are strings - coerce like the evidence endpoint does (a shared
     // z.number() here rejected every call with 400; caught by peer's live run).
     const q = parse(z.object({ lat: z.coerce.number().min(-90).max(90), lon: z.coerce.number().min(-180).max(180) }), req.query);
