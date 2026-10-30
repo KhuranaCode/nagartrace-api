@@ -7,7 +7,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { newWorld, seed, client, userToken, jpeg, reportBody, P_NOROAD } from './helpers.ts';
+import { newWorld, seed, client, userToken, mainAdmin, jpeg, reportBody, P_NOROAD } from './helpers.ts';
 
 let seq = 0;
 const fresh = async (w: any) => client(w, await userToken(`citizen-photo-${++seq}`));
@@ -45,7 +45,7 @@ test('photo-mandatory reports: stage + atomic bind, guards and failure modes', a
       const r = await u.post('/v1/reports', reportBody(spot, { photo_upload_id: uploadId }));
       assert.equal(r.status, 201);
       assert.ok(r.json.photo?.evidence_id);
-      const det = await u.get(`/v1/issues/${r.json.issue.id}`);
+      const det = await (await mainAdmin(wOn)).get(`/v1/issues/${r.json.issue.id}`);
       assert.equal(det.json.evidence.length, 1);
       assert.equal(det.json.evidence[0].kind, 'report');
       const su = (await wOn.adminDb.query('SELECT consumed_at, issue_id FROM staged_uploads WHERE id=$1', [uploadId])).rows[0];
@@ -130,7 +130,7 @@ test('photo-mandatory reports: stage + atomic bind, guards and failure modes', a
       assert.ok(ok[0].json.photo?.evidence_id);
       const n = (await wOn.adminDb.query('SELECT count(*)::int AS n FROM staged_uploads WHERE id=$1 AND consumed_at IS NOT NULL', [uploadId])).rows[0].n;
       assert.equal(n, 1);
-      const det = await a.get(`/v1/issues/${ok[0].json.issue.id}`);
+      const det = await (await mainAdmin(wOn)).get(`/v1/issues/${ok[0].json.issue.id}`);
       assert.equal(det.json.evidence.length, 1);
     });
 
@@ -149,7 +149,7 @@ test('photo-mandatory reports: stage + atomic bind, guards and failure modes', a
       assert.equal(created.length, 1);
       assert.equal(replayed.length, 1);
       assert.equal(replayed[0].json.photo?.evidence_id, created[0].json.photo?.evidence_id);
-      const det = await u.get(`/v1/issues/${created[0].json.issue.id}`);
+      const det = await (await mainAdmin(wOn)).get(`/v1/issues/${created[0].json.issue.id}`);
       assert.equal(det.json.evidence.length, 1);
     });
 
@@ -165,7 +165,7 @@ test('photo-mandatory reports: stage + atomic bind, guards and failure modes', a
       assert.equal(r2.status, 200);
       assert.equal(r2.json.replayed, true);
       assert.equal(r2.json.photo?.evidence_id, r1.json.photo?.evidence_id);
-      const det = await u.get(`/v1/issues/${r1.json.issue.id}`);
+      const det = await (await mainAdmin(wOn)).get(`/v1/issues/${r1.json.issue.id}`);
       assert.equal(det.json.evidence.length, 1);
     });
 
@@ -182,7 +182,7 @@ test('photo-mandatory reports: stage + atomic bind, guards and failure modes', a
       assert.equal(r2.status, 200);
       assert.equal(r2.json.merged_into_existing, true);
       assert.equal(r2.json.issue.id, r1.json.issue.id);
-      const det = await a.get(`/v1/issues/${r1.json.issue.id}`);
+      const det = await (await mainAdmin(wOn)).get(`/v1/issues/${r1.json.issue.id}`);
       assert.equal(det.json.evidence.length, 2);
     });
 
@@ -213,7 +213,7 @@ test('photo-mandatory reports: stage + atomic bind, guards and failure modes', a
       const r2 = await u.post('/v1/reports', reportBody(spot, { photo_upload_id: up2 }), hdr);
       assert.equal(r2.status, 409);
       assert.equal(r2.json.error, 'idempotency_mismatch');
-      const det = await u.get(`/v1/issues/${r1.json.issue.id}`);
+      const det = await (await mainAdmin(wOn)).get(`/v1/issues/${r1.json.issue.id}`);
       assert.equal(det.json.evidence.length, 1); // the second upload was NOT bound
       const su = (await wOn.adminDb.query('SELECT consumed_at FROM staged_uploads WHERE id=$1', [up2])).rows[0];
       assert.equal(su.consumed_at, null); // ... nor consumed

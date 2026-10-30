@@ -18,7 +18,7 @@ test('genuine report is never routed to the synthetic municipality or matched to
   assert.equal(r.status, 201);
   const i = r.json.issue;
   assert.equal(i.test_data, false); assert.equal(i.status, 'reported');
-  assert.equal(i.responsible, null); assert.equal(i.review_org_id, null);
+  assert.equal(i.responsible, null); assert.equal(i.review_org_id, undefined); // report response carries the minimal public DTO (owner-only private fields)
   const row = (await w.adminDb.query('SELECT road_id, review_org_id, suggested_org_id, suggested_flags, suggested_reason, is_test FROM issues WHERE id=$1', [i.id])).rows[0];
   assert.equal(row.road_id, null); assert.equal(row.review_org_id, null); assert.equal(row.suggested_org_id, null); assert.equal(row.is_test, false);
   assert.ok(row.suggested_flags.includes('needs_manual_routing')); assert.match(row.suggested_reason, /No real authority/);

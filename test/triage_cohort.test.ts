@@ -1,6 +1,6 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { newWorld, seed, reportBody, P_WARRANTY, P_NOROAD, type World } from './helpers.ts';
+import { newWorld, seed, mainAdmin, MAIN_ADMIN_SUB, reportBody, P_WARRANTY, P_NOROAD, type World } from './helpers.ts';
 
 let w: World; let s: Awaited<ReturnType<typeof seed>>; let realMuni: string; let realOfficer: any;
 before(async () => {
@@ -53,14 +53,22 @@ test('public and admin scorecards are separated by cohort; public never counts f
   const b = (await f1.c.post('/v1/reports', reportBody(P_WARRANTY))).json.issue.id;
   const c = (await f2.c.post('/v1/reports', reportBody(P_NOROAD))).json.issue.id;
   await w.adminDb.query(`UPDATE issues SET responsible_org_id=$2, responsible_kind='contractor' WHERE id = ANY($1::uuid[])`, [[a, b, c], s.contractorOrg]);
-  const pub = (await g.c.get('/v1/public/scorecards')).json.scorecards;
-  assert.equal(pub.find((x: any) => x.org_id === s.contractorOrg)?.issues, 1); // only the genuine issue
-  // admin-1 is a genuine-cohort user; mark one admin as fixture to see the other board
+  // settled policy: even with PUBLIC_SCORECARDS=true the public route is owner-only (complaint-derived
+  // contractor targeting); non-owners get the same 404 as a disabled flag
+  assert.equal((await g.c.get('/v1/public/scorecards')).status, 404);
+  const pubOwner = (await (await mainAdmin(w)).get('/v1/public/scorecards')).json.scorecards;
+  assert.equal(pubOwner.find((x: any) => x.org_id === s.contractorOrg)?.issues, 1); // real-cohort board only, never fixtures
+  // settled privacy policy: complaint-linked contractor performance is owner-only. Municipal admin
+  // ROLE (genuine or fixture) gets 403; the exact owner principal sees their own cohort's board.
   const fa = await fixture('sc-fix-admin'); await w.adminDb.query(`INSERT INTO memberships (user_id, org_id, role) VALUES ($1,$2,'admin')`, [fa.id, s.muni]);
-  const fixBoard = (await fa.c.get('/v1/admin/scorecards')).json.scorecards;
-  assert.equal(fixBoard.find((x: any) => x.org_id === s.contractorOrg)?.issues, 2);
-  const realBoard = (await s.admin.c.get('/v1/admin/scorecards')).json.scorecards;
+  assert.equal((await fa.c.get('/v1/admin/scorecards')).status, 403);
+  assert.equal((await s.admin.c.get('/v1/admin/scorecards')).status, 403);
+  const mad = await mainAdmin(w);
+  const realBoard = (await mad.get('/v1/admin/scorecards')).json.scorecards;
   assert.equal(realBoard.find((x: any) => x.org_id === s.contractorOrg)?.issues, 1);
+  await w.adminDb.query(`UPDATE users SET is_test=true WHERE subject=$1`, [MAIN_ADMIN_SUB]);
+  const fixBoard = (await mad.get('/v1/admin/scorecards')).json.scorecards;
+  assert.equal(fixBoard.find((x: any) => x.org_id === s.contractorOrg)?.issues, 2);
 });
 
 test('leaderboard is separated by the caller cohort with no overlap', async () => {

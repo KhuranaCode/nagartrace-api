@@ -38,6 +38,14 @@ export async function authenticate(header: string | undefined, cfg: Config, keys
   return { userId: u.id, issuer: iss, subject: sub, suspended: false, ageHours: Number(u.age_h), email };
 }
 
+/** The single deployment-owner principal, pinned by the EXACT verified issuer + subject (JWT sub).
+ *  Roles, org memberships, email claims and user_metadata are never consulted - there is no admin-role
+ *  fallback. Unset config fails CLOSED: nobody is the owner. This is the only caller-side check for
+ *  complaint-linked private data; the value is server-authoritative config, never client input. */
+export function isMainAdmin(p: Principal, cfg: Config): boolean {
+  return !!cfg.mainAdminSubject && p.issuer === cfg.authIssuer && p.subject === cfg.mainAdminSubject;
+}
+
 export type Membership = { org_id: string; role: 'admin' | 'officer' | 'contractor' | 'utility'; kind: string; synthetic: boolean };
 
 export async function memberships(db: pg.Pool | pg.PoolClient, userId: string): Promise<Membership[]> {

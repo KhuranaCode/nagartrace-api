@@ -1,6 +1,6 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { newWorld, seed, reportBody, P_WARRANTY, P_UTILITY, P_NOROAD, jpeg, type World } from './helpers.ts';
+import { newWorld, seed, mainAdmin, reportBody, P_WARRANTY, P_UTILITY, P_NOROAD, jpeg, type World } from './helpers.ts';
 import { fromEnv } from '../src/config.ts';
 
 let w: World; let s: Awaited<ReturnType<typeof seed>>;
@@ -41,6 +41,8 @@ test('only the reviewing municipality officer can verify; verification assigns, 
   assert.equal(v.status, 200); assert.equal(v.json.status, 'assigned'); assert.equal(v.json.responsible_kind, 'utility');
   const after = (await a.c.get(`/v1/issues/${iss.id}`)).json;
   assert.equal(after.status, 'assigned'); assert.equal(after.responsible.kind, 'utility'); assert.ok(after.deadline_at);
+  assert.equal(after.responsible.name, undefined); // org NAME is owner-only
+  assert.equal((await (await mainAdmin(w)).get(`/v1/issues/${iss.id}`)).json.responsible.name, 'Test Telecom'); // owner restores the private name
   const ev = (await w.adminDb.query(`SELECT kind, actor_id FROM status_events WHERE issue_id=$1 ORDER BY id`, [iss.id])).rows;
   assert.deepEqual(ev.map((x: any) => x.kind), ['created', 'routing_suggested', 'verified_by_officer', 'routed']);
   assert.equal(ev[2].actor_id, s.officer.id);
@@ -48,14 +50,16 @@ test('only the reviewing municipality officer can verify; verification assigns, 
   assert.equal((await s.officer.c.post(`/v1/issues/${iss.id}/verify`, { decision: 'verify', reason: 'twice is not allowed' })).status, 404); // no longer pending
 });
 
-test('rejecting leaves no authority, no points, and the evidence stays reviewer/reporter-only', async () => {
+test('rejecting leaves no authority, no points, and the evidence stays uploader/owner-only', async () => {
   const a = await s.mk('rv-c');
   const iss = (await a.c.post('/v1/reports', reportBody(P_WARRANTY, { note: 'x' }))).json.issue;
   const up = await a.c.upload(`/v1/issues/${iss.id}/evidence?kind=report&lat=${P_WARRANTY.lat}&lon=${P_WARRANTY.lon}`, await jpeg());
   assert.equal(up.status, 201);
   const eid = up.json.id ?? up.json.evidence_id;
   assert.equal((await s.contractor.c.get(`/v1/issues/${iss.id}/evidence/${eid}`)).status, 404);
-  assert.equal((await s.officer.c.get(`/v1/issues/${iss.id}/evidence/${eid}`)).status, 200); // reviewing officer
+  assert.equal((await s.officer.c.get(`/v1/issues/${iss.id}/evidence/${eid}`)).status, 404); // settled policy: reviewer role is not a photo grant
+  assert.equal((await a.c.get(`/v1/issues/${iss.id}/evidence/${eid}`)).status, 200); // own uploader
+  assert.equal((await (await mainAdmin(w)).get(`/v1/issues/${iss.id}/evidence/${eid}`)).status, 200); // exact owner principal
   const r = await s.officer.c.post(`/v1/issues/${iss.id}/verify`, { decision: 'reject', reason: 'Photo shows no hazard at this spot' });
   assert.equal(r.json.status, 'rejected');
   assert.equal((await w.adminDb.query(`SELECT count(*)::int n FROM points_ledger WHERE issue_id=$1`, [iss.id])).rows[0].n, 0);

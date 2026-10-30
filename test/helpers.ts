@@ -12,6 +12,9 @@ import { localStore } from '../src/storage.ts';
 
 export const OWNER = process.env.TEST_OWNER_URL ?? 'postgresql://sandbox@127.0.0.1:55432/postgres';
 export const ISSUER = 'https://issuer.test/';
+/** Test-world deployment-owner subject. Every newWorld gets it unless overridden (pass
+ *  { mainAdminSubject: undefined } to exercise the fail-closed path). */
+export const MAIN_ADMIN_SUB = 'main-admin-sub';
 export const AUDIENCE = 'nagartrace-api';
 const kp = await generateKeyPair('RS256');
 const other = await generateKeyPair('RS256');
@@ -31,7 +34,7 @@ export async function newWorld(over: Partial<Config> = {}, clock?: { t: number }
   const runtime = new pg.Pool({ connectionString: base.replace('sandbox@', 'nagartrace_runtime@'), max: 20 });
   const adminDb = new pg.Pool({ connectionString: base, max: 2 });
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ntblob-'));
-  const cfg: Config = { ...defaults(), authIssuer: ISSUER, authAudience: AUDIENCE, databaseUrl: base, storageDir: dir, confirmMinAccountAgeHours: 0, rateLimitMax: 100000, verificationMode: 'auto_checks', ...over };
+  const cfg: Config = { ...defaults(), authIssuer: ISSUER, authAudience: AUDIENCE, databaseUrl: base, storageDir: dir, confirmMinAccountAgeHours: 0, rateLimitMax: 100000, verificationMode: 'auto_checks', mainAdminSubject: MAIN_ADMIN_SUB, ...over };
   const app = await buildApp({ cfg, db: runtime, keys: kp.publicKey, store: store ?? localStore(dir), now: clock ? () => new Date(clock.t) : undefined });
   return {
     app, runtime, adminDb, cfg,
@@ -49,6 +52,8 @@ export function client(w: World, token: string) {
   return { get: (u: string) => call('GET', u), post: (u: string, b?: unknown, h?: Record<string, string>) => call('POST', u, b ?? {}, h), patch: (u: string, b: unknown) => call('PATCH', u, b), delete: (u: string) => call('DELETE', u), upload: (u: string, img: Buffer, type = 'image/jpeg') => call('POST', u, img, { 'content-type': type }) };
 }
 export async function userToken(sub: string) { return sign(sub); }
+/** Authenticated client for the test-world deployment owner (exact configured subject). */
+export async function mainAdmin(w: World) { return client(w, await sign(MAIN_ADMIN_SUB)); }
 export async function jpeg(withExif = false) {
   let s = sharp({ create: { width: 640, height: 480, channels: 3, background: { r: 90, g: 90, b: 90 } } });
   if (withExif) s = s.withExif({ IFD0: { Copyright: 'SECRET-TEST-TAG' } });

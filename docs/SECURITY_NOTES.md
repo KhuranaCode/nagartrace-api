@@ -2,7 +2,7 @@
 
 Checked by reading the code and by tests (52 local tests, restricted DB role; plus a hosted Supabase run on synthetic data):
 - AuthN: jose verify with issuer, audience, exp, signature, RS256/ES256 only; identity = (iss, sub). Roles only from memberships table, written only by admin endpoints or the owner connection.
-- AuthZ: issue reads, evidence reads and every mutation check reporter or responsible/copy org membership; non-participants get 404 (no existence leak). Tested with a second municipality and a second contractor.
+- AuthZ: every mutation still checks reporter or responsible/copy org membership; non-participants get 404 (no existence leak). READS are owner-scoped (2026-10-31 policy): photo bytes go only to the own uploader or the exact deployment-owner principal (MAIN_ADMIN_SUBJECT, fail-closed when unset); complaint-linked private fields (route reasons, org ids, events, disputes, scorecards) are owner-only and everyone else gets the anonymous public payload. Tested with a second municipality and a second contractor.
 - DB: runtime role cannot DDL, DELETE, or UPDATE audit/ledger/evidence/reports/memberships; users only alias, ward, points. Tested by attempting the statements.
 - Public API: allowlisted DTO, rounded coordinates, no reporter/evidence. Tested.
 - Input: zod strict bodies, uuid params, 10 MB body cap, image content sniffing and bounded decode.

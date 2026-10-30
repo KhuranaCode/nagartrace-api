@@ -3,7 +3,7 @@ import rateLimit from '@fastify/rate-limit';
 import { z } from 'zod';
 import type pg from 'pg';
 import type { Config } from './config.ts';
-import { authenticate, HttpError, memberships, type KeyResolver, type Membership, type Principal } from './auth.ts';
+import { authenticate, HttpError, isMainAdmin, memberships, type KeyResolver, type Membership, type Principal } from './auth.ts';
 import { awardPoints, deadlineHours, lockIssue, recordEvent, routeIssue, runEscalations, severityOf, transition } from './domain.ts';
 import { registerStreakRoutes } from './streaks.ts';
 import { registerFollowupRoutes } from './followup.ts';
@@ -45,21 +45,21 @@ export function pgEnumArray(v: unknown): string[] {
 export const complaintId = (no: number | string | null | undefined) =>
   no == null ? null : `NT-${String(no).padStart(6, '0')}`;
 
-/** Official records for a PUBLIC view: computed from the same rounded point the public sees,
- *  so nearest-road selection and derived distances can never leak finer private precision. */
-async function publicOfficialRecords(db: pg.Pool, r: any) {
-  return officialRecordsForPoint(db, Math.round(r.lat * 1e4) / 1e4, Math.round(r.lon * 1e4) / 1e4);
-}
 function publicDto(r: any) {
   return {
     id: r.id, complaint_no: r.complaint_no == null ? null : Number(r.complaint_no), complaint_id: complaintId(r.complaint_no == null ? null : Number(r.complaint_no)), hazard: r.hazard, hazards: pgEnumArray(r.hazards), status: r.status, severity: r.severity, ward: r.ward,
     location: { lat: Math.round(r.lat * 1e4) / 1e4, lon: Math.round(r.lon * 1e4) / 1e4 },
-    responsible: r.responsible_org_name ? { kind: r.responsible_kind, name: r.responsible_org_name, synthetic_data: !!r.responsible_synthetic } : null,
+    // Settled privacy policy: the assigned organisation's NAME is complaint-linked contractor
+    // targeting and is owner-only. The minimal public map keeps the responsible KIND only
+    // (contractor/utility/municipality), never the name. (Routing flags carry code-only tokens like
+    // road_not_in_registry - no identities - and the deadline carries no identity: both stay public.)
+    responsible: r.responsible_org_name ? { kind: r.responsible_kind, synthetic_data: !!r.responsible_synthetic } : null,
     deadline_at: r.deadline_at, reports_count: r.reports_count, route_flags: r.route_flags, created_at: r.created_at, updated_at: r.updated_at,
   };
 }
 function fullDto(r: any) {
   return { ...publicDto(r), test_data: !!r.is_test, location: { lat: r.lat, lon: r.lon }, danger_flag: r.danger_flag, route_reason: r.route_reason, route_overridden: r.route_overridden,
+    responsible: r.responsible_org_name ? { kind: r.responsible_kind, name: r.responsible_org_name, synthetic_data: !!r.responsible_synthetic } : null, // owner restores the private name
     reopen_count: r.reopen_count, fixed_at: r.fixed_at, copy_org: r.copy_org_name ?? null,
     responsible_org_id: r.responsible_org_id ?? null, copy_org_id: r.copy_org_id ?? null, review_org_id: r.review_org_id ?? null };
 }
@@ -306,7 +306,10 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
       return { issueId, reportId: rep.rows[0].id, created, merged, replay: false, photo };
     });
     const row = (await db.query(`SELECT ${ISSUE_COLS} ${ISSUE_FROM} WHERE i.id=$1`, [result.issueId])).rows[0];
-    return reply.status(result.replay ? 200 : result.created ? 201 : 200).send({ report_id: result.reportId, merged_into_existing: result.merged, replayed: result.replay, issue: fullDto(row), ...(result.photo ? { photo: result.photo } : {}) });
+    // A report that MERGED into an existing complaint must not hand the new reporter that complaint's
+    // private fields (route narrative, org ids, precise location): same settled rule as GET /v1/issues/:id.
+    // test_data stays: it is the data-separation honesty label, not private content.
+    return reply.status(result.replay ? 200 : result.created ? 201 : 200).send({ report_id: result.reportId, merged_into_existing: result.merged, replayed: result.replay, issue: { ...publicDto(row), test_data: !!row.is_test }, ...(result.photo ? { photo: result.photo } : {}) });
   });
 
   // ---------- reading issues ----------
@@ -315,13 +318,17 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
     const ms = await memberships(db, p.userId);
     const q = parse(z.object({ responsible: z.enum(['municipality','contractor','utility']).optional(), status: z.string().optional(), limit: z.coerce.number().int().min(1).max(200).default(50) }), req.query);
     const mine = orgIds(ms);
+    // The exact deployment-owner principal additionally lists every issue in their own test/real cohort
+    // (oversight). The cohort guard keeps the 006 test-data separation absolute: no cross-cohort reads.
+    const owner = isMainAdmin(p, cfg);
     const r = await db.query(
       `SELECT ${ISSUE_COLS} ${ISSUE_FROM}
-       WHERE (EXISTS (SELECT 1 FROM reports rp WHERE rp.issue_id=i.id AND rp.user_id=$1) OR i.responsible_org_id = ANY($2::uuid[]) OR i.copy_org_id = ANY($2::uuid[]) OR (i.status='reported' AND (i.review_org_id = ANY($6::uuid[]) OR (i.review_org_id IS NULL AND $7::boolean AND EXISTS (SELECT 1 FROM orgs tz WHERE tz.id = ANY($6::uuid[]) AND tz.is_synthetic = i.is_test)))))
-       AND ($3::text IS NULL OR i.status::text=$3) AND ($5::text IS NULL OR i.responsible_kind::text=$5) ORDER BY i.created_at DESC LIMIT $4`, [p.userId, mine, q.status ?? null, q.limit, q.responsible ?? null, orgIds(ms.filter((m) => m.kind === 'municipality' && ['officer', 'admin'].includes(m.role))), cfg.unroutedTriage === 'any_municipal_staff']);
+       WHERE (EXISTS (SELECT 1 FROM reports rp WHERE rp.issue_id=i.id AND rp.user_id=$1) OR i.responsible_org_id = ANY($2::uuid[]) OR i.copy_org_id = ANY($2::uuid[]) OR (i.status='reported' AND (i.review_org_id = ANY($6::uuid[]) OR (i.review_org_id IS NULL AND $7::boolean AND EXISTS (SELECT 1 FROM orgs tz WHERE tz.id = ANY($6::uuid[]) AND tz.is_synthetic = i.is_test)))) OR ($8::boolean AND i.is_test = (SELECT u.is_test FROM users u WHERE u.id=$1)))
+       AND ($3::text IS NULL OR i.status::text=$3) AND ($5::text IS NULL OR i.responsible_kind::text=$5) ORDER BY i.created_at DESC LIMIT $4`, [p.userId, mine, q.status ?? null, q.limit, q.responsible ?? null, orgIds(ms.filter((m) => m.kind === 'municipality' && ['officer', 'admin'].includes(m.role))), cfg.unroutedTriage === 'any_municipal_staff', owner]);
     // Unrouted reports seen only through triage get the public (rounded, no reporter) view.
     const rep = new Set((await db.query('SELECT DISTINCT issue_id FROM reports WHERE user_id=$1', [p.userId])).rows.map((x) => x.issue_id));
-    return { issues: r.rows.map((x) => (x.status === 'reported' && !x.review_org_id && !rep.has(x.id) ? { ...publicDto(x), triage_only: true } : fullDto(x))) };
+    // Complaint-linked private fields are owner-only; everyone else gets the same minimal public shape.
+    return { issues: r.rows.map((x) => (x.status === 'reported' && !x.review_org_id && !rep.has(x.id) && !owner ? { ...publicDto(x), triage_only: true } : owner ? fullDto(x) : publicDto(x))) };
   });
   app.get('/v1/issues/:id', async (req) => {
     const p = await auth(req);
@@ -330,14 +337,25 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
     const r = await db.query(`SELECT ${ISSUE_COLS} ${ISSUE_FROM} WHERE i.id=$1`, [id]);
     if (!r.rowCount) throw new HttpError(404, 'Issue not found', 'not_found');
     const issue = r.rows[0];
+    // Deployment-owner oversight: the exact configured principal, restricted to their own test/real
+    // cohort so the 006 data separation still holds. Unset config fails closed (isMainAdmin false).
+    const owner = isMainAdmin(p, cfg) && !!(await db.query('SELECT 1 FROM users WHERE id=$1 AND is_test=$2', [p.userId, issue.is_test])).rowCount;
     const staff = isStaffOf(issue, ms, ['admin', 'officer', 'contractor', 'utility']) || isReviewer(issue, ms) || isTriager(issue, ms);
-    if (!staff && !(await isReporter(db, id, p.userId))) throw new HttpError(404, 'Issue not found', 'not_found');
-    if (!isStaffOf(issue, ms, ['admin', 'officer', 'contractor', 'utility']) && !isReviewer(issue, ms) && !(await isReporter(db, id, p.userId))) return { ...publicDto(issue), triage_only: true, official_records: await publicOfficialRecords(db, issue) }; // triage view: public-level fields + official records from the public point
+    if (!owner && !staff && !(await isReporter(db, id, p.userId))) throw new HttpError(404, 'Issue not found', 'not_found');
+    // Settled privacy policy: complaint-linked private narrative/details and contractor candidate
+    // targeting (fullDto org ids, route reasons, events, evidence list, disputes, official records
+    // linked to this complaint) are OWNER-ONLY. Every other legitimate viewer - reporter, municipal
+    // staff, contractor, reviewer - gets exactly the anonymous public payload: the minimal status map
+    // ONLY. The standalone public historical catalog (/v1/public/gov-records/nhai-awards) is unchanged.
+    if (!owner) {
+      const triageOnly = !isStaffOf(issue, ms, ['admin', 'officer', 'contractor', 'utility']) && !isReviewer(issue, ms) && !(await isReporter(db, id, p.userId));
+      return { ...publicDto(issue), ...(triageOnly ? { triage_only: true } : {}) };
+    }
     const events = (await db.query('SELECT id, kind, from_status, to_status, reason, actor_id IS NULL AS system, created_at FROM status_events WHERE issue_id=$1 ORDER BY id', [id])).rows;
     const ev = (await db.query('SELECT id, kind, location_ok, created_at FROM evidence WHERE issue_id=$1 ORDER BY created_at', [id])).rows;
-    // Dispute ids go only to staff of the issue's orgs (contractor/utility raise, municipal staff decide). Reporters never see them.
-    const staffView = isStaffOf(issue, ms, ['admin', 'officer', 'contractor', 'utility']);
-    const disputes = staffView ? (await db.query('SELECT id, status, reason, org_id, evidence_id, created_at, decided_at, decision_reason FROM disputes WHERE issue_id=$1 ORDER BY created_at', [id])).rows : undefined;
+    // Owner-only payload: full dispute detail included for oversight. (Before this policy, dispute ids
+    // went to staff of the issue's orgs; see KNOWN_GAPS for the resulting staff discoverability change.)
+    const disputes = (await db.query('SELECT id, status, reason, org_id, evidence_id, created_at, decided_at, decision_reason FROM disputes WHERE issue_id=$1 ORDER BY created_at', [id])).rows;
     return { ...fullDto(issue), events, evidence: ev, ...(disputes ? { disputes } : {}), official_records: await officialRecordsForPoint(db, issue.lat, issue.lon), redaction: 'none (photos are never public)' };
   });
 
@@ -351,15 +369,25 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
     const id = parse(uuid, (req.params as any).id);
     const r = await db.query(`SELECT ${ISSUE_COLS} ${ISSUE_FROM} WHERE i.id=$1`, [id]);
     if (!r.rowCount || r.rows[0].is_test) throw new HttpError(404, 'Issue not found', 'not_found');
-    const row = r.rows[0];
-    return { ...publicDto(row), official_records: await publicOfficialRecords(db, row) };
+    // Minimal public map/status ONLY: complaint-linked candidate associations (official records tied
+    // to this complaint) are owner-only under the settled privacy policy. The STANDALONE historical
+    // NHAI catalog stays public at /v1/public/gov-records/nhai-awards.
+    return publicDto(r.rows[0]);
   });
   app.get('/v1/public/gov-records/nhai-awards', async (req) => {
     const q = parse(z.object({ state: z.string().max(60).optional(), nh: z.string().max(20).optional(), limit: z.coerce.number().int().min(1).max(352).default(100) }).strict(), req.query);
     return nhaiAwardsBrowse(db, q);
   });
-  app.get('/v1/public/scorecards', async () => {
+  app.get('/v1/public/scorecards', async (req) => {
     if (!cfg.publicScorecards) throw new HttpError(404, 'Public scorecards are not enabled (legal review pending)', 'not_enabled');
+    // Settled privacy policy: scorecards are complaint-derived contractor targeting, so they are
+    // owner-only even when this flag is enabled - the flag must not bypass the restriction. With the
+    // flag ON, the exact owner principal gets the real-cohort board here; everyone else (including
+    // unauthenticated callers) gets the same 404 as a disabled flag. Consequence: the flag is now an
+    // owner-preview only; a truly public scoreboard needs a non-targeting redesign the owner approves.
+    let owner = false;
+    try { owner = isMainAdmin(await auth(req), cfg); } catch { owner = false; }
+    if (!owner) throw new HttpError(404, 'Public scorecards are not enabled (legal review pending)', 'not_enabled');
     return { scorecards: await scorecards(db, false) };
   });
   app.get('/v1/leaderboard', async (req) => {
@@ -473,11 +501,14 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
   app.get('/v1/issues/:id/evidence/:eid', async (req, reply) => {
     const p = await auth(req);
     const id = parse(uuid, (req.params as any).id); const eid = parse(uuid, (req.params as any).eid);
-    const ms = await memberships(db, p.userId);
-    const r = await db.query(`SELECT e.*, i.responsible_org_id, i.copy_org_id, i.review_org_id, i.status FROM evidence e JOIN issues i ON i.id=e.issue_id WHERE e.id=$1 AND e.issue_id=$2`, [eid, id]);
+    const r = await db.query(`SELECT e.*, i.responsible_org_id, i.copy_org_id, i.review_org_id, i.status, i.is_test FROM evidence e JOIN issues i ON i.id=e.issue_id WHERE e.id=$1 AND e.issue_id=$2`, [eid, id]);
     if (!r.rowCount) throw new HttpError(404, 'Not found', 'not_found');
     const e = r.rows[0];
-    const allowed = isStaffOf(e, ms, ['admin', 'officer', 'contractor', 'utility']) || isReviewer(e, ms) || e.uploader_id === p.userId || await isReporter(db, id, p.userId);
+    // Photos are readable ONLY by the evidence's own uploader or the exact deployment-owner principal
+    // (same-cohort). No staff/officer/contractor/utility/reviewer/merged-reporter or admin-role access:
+    // roles are never a photo grant. Unset owner config fails closed.
+    const owner = isMainAdmin(p, cfg) && !!(await db.query('SELECT 1 FROM users WHERE id=$1 AND is_test=$2', [p.userId, e.is_test])).rowCount;
+    const allowed = e.uploader_id === p.userId || owner;
     if (!allowed) throw new HttpError(404, 'Not found', 'not_found');
     return reply.header('content-type', e.content_type).header('content-disposition', 'inline').send(await store.get(e.storage_key));
   });
@@ -752,8 +783,10 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
   });
   app.get('/v1/admin/scorecards', async (req) => {
     const p = await auth(req);
-    const ms = await memberships(db, p.userId);
-    if (!ms.some((m) => (m.role === 'admin' || m.role === 'officer') && m.kind === 'municipality')) throw new HttpError(403, 'Municipal staff only', 'forbidden');
+    // Complaint-linked contractor performance (fix/reopen rates derived from complaints) is contractor
+    // targeting data: settled policy restricts it to the exact deployment-owner principal, not any
+    // municipal admin/officer role. The separate PUBLIC_SCORECARDS gate is untouched.
+    if (!isMainAdmin(p, cfg)) throw new HttpError(403, 'Deployment owner only', 'forbidden');
     return { scorecards: await scorecards(db, !!(await db.query('SELECT is_test FROM users WHERE id=$1', [p.userId])).rows[0]?.is_test), note: 'Counts only issues with no open dispute (PRD). Not public until legal review.' };
   });
 

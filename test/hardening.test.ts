@@ -1,6 +1,6 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { newWorld, seed, client, reportBody, jpeg, userToken, P_WARRANTY, type World } from './helpers.ts';
+import { newWorld, seed, client, mainAdmin, reportBody, jpeg, userToken, P_WARRANTY, type World } from './helpers.ts';
 import { fromEnv, POLICY_KEYS } from '../src/config.ts';
 import { buildApp, csvRows } from '../src/app.ts';
 import { defaults } from '../src/config.ts';
@@ -73,9 +73,9 @@ test('public surface: exact key allowlist, no leaks via errors, ids, aggregates 
   await a.c.upload(`/v1/issues/${iss.id}/evidence?kind=report&lat=30.7&lon=76.7002`, await jpeg());
   const get = async (url: string) => w.app.inject({ method: 'GET', url });
   const one = (await get(`/v1/public/issues/${iss.id}`)).json();
-  assert.deepEqual(Object.keys(one).sort(), ['complaint_id', 'complaint_no', 'created_at', 'deadline_at', 'hazard', 'hazards', 'id', 'location', 'official_records', 'reports_count', 'responsible', 'route_flags', 'severity', 'status', 'updated_at', 'ward'].sort()); // complaint_id is a public display reference, no reporter identity; hazards is the same already-public hazard class as hazard
-  assert.deepEqual(Object.keys(one.official_records).sort(), ['candidate_awards', 'candidate_warning', 'coverage_note', 'responsible_contractor', 'road']); // public government data only: no operator tags, no reporter identity
-  assert.deepEqual(Object.keys(one.responsible).sort(), ['kind', 'name', 'synthetic_data']);
+  assert.deepEqual(Object.keys(one).sort(), ['complaint_id', 'complaint_no', 'created_at', 'deadline_at', 'hazard', 'hazards', 'id', 'location', 'reports_count', 'responsible', 'route_flags', 'severity', 'status', 'updated_at', 'ward'].sort()); // complaint_id is a public display reference, no reporter identity; hazards is the same already-public hazard class as hazard // complaint_id is a public display reference, no reporter identity; hazards is the same already-public hazard class as hazard
+  assert.ok(!('official_records' in one)); // settled policy: complaint-linked candidate associations are owner-only, even on the public route
+  assert.deepEqual(Object.keys(one.responsible).sort(), ['kind', 'synthetic_data']); // no contractor NAME: complaint-linked targeting is owner-only
   assert.deepEqual(Object.keys(one.location).sort(), ['lat', 'lon']);
   const list = (await get('/v1/public/issues?limit=200')).body;
   for (const secret of ['my private note', a.id, b.id, 'pub-a', 'issuer.test', 'storage_key', 'sha256', 'alias']) assert.ok(!list.includes(secret), 'leak: ' + secret);
@@ -108,8 +108,10 @@ test('evidence authorization matrix incl. a second municipality', async () => {
   const iss = (await rep(r, { lat: 30.7000, lon: 76.7003 })).json.issue;
   const up = await r.c.upload(`/v1/issues/${iss.id}/evidence?kind=report&lat=30.7&lon=76.7003`, await jpeg());
   const url = `/v1/issues/${iss.id}/evidence/${up.json.evidence_id}`;
-  const who: [string, any, number][] = [['reporter', r, 200], ['officer same city', s.officer, 200], ['assigned contractor', s.contractor, 200], ['other citizen', other, 404], ['officer other city', officer2, 404], ['admin other city', admin2, 404]];
+  // settled policy: photo bytes go ONLY to the own uploader and the exact owner principal - no role grants
+  const who: [string, any, number][] = [['reporter (uploader)', r, 200], ['officer same city', s.officer, 404], ['assigned contractor', s.contractor, 404], ['other citizen', other, 404], ['officer other city', officer2, 404], ['admin other city', admin2, 404]];
   for (const [name, u, want] of who) assert.equal((await u.c.get(url)).status, want, name);
+  assert.equal((await (await mainAdmin(w)).get(url)).status, 200, 'exact owner principal');
   assert.equal((await w.app.inject({ method: 'GET', url })).statusCode, 401);
   for (const u of [officer2, admin2, other]) {
     assert.equal((await u.c.get(`/v1/issues/${iss.id}`)).status, 404);

@@ -34,3 +34,11 @@ All values are POLICY_* env vars. The app refuses to start with NODE_ENV=product
 - Tests ran on one local PostgreSQL 14 only; nothing hosted.
 
 - Auto-verification vs officer review: OPEN, user decision needed. Escalation for never-verified reports: undefined.
+
+## Owner-scoped reads: operational consequences (2026-10-31)
+- Dispute discoverability: municipal staff no longer see dispute ids/reasons in `GET /v1/issues/:id` (owner-only payload). `POST /disputes/:id/decide` still authorises municipal staff, but staff currently have no in-API way to learn a dispute id. If staff adjudication is meant to continue, a follow-up should add a narrow staff-visible "open dispute exists" signal or route decisions through the owner. Deliberate trade-off of the settled policy, flagged for the reviewer.
+- Evidence metadata list (`evidence[]` on the issue detail) is owner-only; uploaders learn their evidence ids from the upload/report responses.
+- Reporters and staff no longer receive precise coordinates or route narrative on their own issues; the client must render the minimal public payload.
+- Public candidate linkage removed: `/v1/public/issues/:id` no longer serves `official_records` (complaint-linked NHAI candidate associations) to anyone but the owner; only the standalone historical catalog `/v1/public/gov-records/nhai-awards` remains public. Clients that rendered candidates on the public issue page lose that block.
+- `PUBLIC_SCORECARDS=true` is now an owner-preview, not a public feature: the route authenticates softly and serves only the exact owner principal (404 for everyone else, same as disabled). A genuinely public scoreboard would need a non-targeting aggregate redesign the owner approves.
+- Public map minimisation (peer blocker 2026-10-31): PublicIssue no longer carries the assigned organisation's name, the assignment deadline, or route flags - only the responsible KIND remains. Clients that showed "assigned to <contractor>", due dates, or routing flags on public/non-owner views lose them; the owner view restores them.

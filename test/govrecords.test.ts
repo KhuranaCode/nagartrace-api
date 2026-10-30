@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { newWorld, seed, client, sign, reportBody } from './helpers.ts';
+import { newWorld, seed, client, sign, mainAdmin, reportBody } from './helpers.ts';
 import { nhTokens, officialRecordsForPoint } from '../src/govrecords.ts';
 
 test('nhTokens: strict whole-reference NH validation, no fuzzy/digit-only matches', () => {
@@ -102,7 +102,7 @@ test('nearest staged road with SH/SR/bare-digit ref yields NO NH candidates', as
   } finally { await w.close(); }
 });
 
-test('HTTP: public issue detail carries official_records; browse endpoint serves verbatim rows', async () => {
+test('HTTP: complaint-linked records are owner-only; browse endpoint serves verbatim rows', async () => {
   const w = await newWorld();
   try {
     await seed(w);
@@ -112,13 +112,19 @@ test('HTTP: public issue detail carries official_records; browse endpoint serves
     const rep = await a.post('/v1/reports', reportBody({ lat: 30.7005, lon: 76.7005 }));
     assert.equal(rep.status, 201);
     const id = rep.json.issue.id;
+    // settled policy: NO complaint-linked candidate associations for non-owners, public or authenticated
     const pub = await client(w, await sign('gov-b')).get(`/v1/public/issues/${id}`);
     assert.equal(pub.status, 200);
-    assert.equal(pub.json.official_records.road.name, 'NH 44 Strip');
-    assert.equal(pub.json.official_records.candidate_awards[0].contractor_name, 'Real Builder One');
+    assert.ok(!('official_records' in pub.json));
     const det = await a.get(`/v1/issues/${id}`);
     assert.equal(det.status, 200);
-    assert.equal(det.json.official_records.candidate_awards.length, 1);
+    assert.ok(!('official_records' in det.json));
+    // the exact owner principal still gets the complaint-linked records (precise point)
+    const od = await (await mainAdmin(w)).get(`/v1/issues/${id}`);
+    assert.equal(od.status, 200);
+    assert.equal(od.json.official_records.road.name, 'NH 44 Strip');
+    assert.equal(od.json.official_records.candidate_awards.length, 1);
+    assert.equal(od.json.official_records.candidate_awards[0].contractor_name, 'Real Builder One');
     // browse
     const all = await a.get('/v1/public/gov-records/nhai-awards');
     assert.equal(all.status, 200);
@@ -141,33 +147,9 @@ test('HTTP: public issue detail carries official_records; browse endpoint serves
       const r2 = await a.get(`/v1/public/gov-records/nhai-awards?nh=${encodeURIComponent(v)}`);
       assert.equal(r2.status, 400, `nh=${v} must not broaden to all awards`);
     }
-    assert.equal(pub.json.official_records.responsible_contractor, 'unknown');
-    assert.equal(pub.json.official_records.candidate_awards[0].match_status, 'candidate');
-    assert.match(pub.json.official_records.coverage_note, /responsible contractor for this report is UNKNOWN/);
+    assert.equal(od.json.official_records.responsible_contractor, 'unknown');
+    assert.equal(od.json.official_records.candidate_awards[0].match_status, 'candidate');
+    assert.match(od.json.official_records.coverage_note, /responsible contractor for this report is UNKNOWN/);
   } finally { await w.close(); }
 });
 
-test('PUBLIC PRECISION: public official_records derive from the public rounded point only', async () => {
-  const w = await newWorld();
-  try {
-    await seed(w);
-    await insertRoad2(w, { name: 'NH 44 Strip', ref: 'NH-44' });
-    await insertAward(w, { sr: 902, nh: ['44'], contractor: 'Real Builder One' });
-    const a = client(w, await sign('gov-a'));
-    // raw point slightly offset from the road; its 1e4-rounded public point differs in distance
-    const rep = await a.post('/v1/reports', reportBody({ lat: 30.70019, lon: 76.70004 })); // off the diagonal: rounding changes the derived distance
-    assert.equal(rep.status, 201);
-    const id = rep.json.issue.id;
-    const pub = await client(w, await sign('gov-b')).get(`/v1/public/issues/${id}`);
-    assert.equal(pub.status, 200);
-    const loc = pub.json.location;
-    assert.equal(loc.lat, Math.round(30.70019 * 1e4) / 1e4);
-    const atPublicPoint = JSON.parse(JSON.stringify(await officialRecordsForPoint(w.adminDb, loc.lat, loc.lon))); // JSON-normalized like the wire
-    assert.deepEqual(pub.json.official_records, atPublicPoint);
-    const atPrivatePoint = await officialRecordsForPoint(w.adminDb, 30.70019, 76.70004);
-    if (atPrivatePoint.road && atPublicPoint.road) assert.notEqual(atPrivatePoint.road.distance_m, atPublicPoint.road.distance_m, 'regression needs a point where rounding changes the derived distance');
-    // hidden-404 for non-reporter non-staff is retained
-    const tri = await client(w, await sign('gov-c')).get(`/v1/issues/${id}`);
-    assert.equal(tri.status, 404);
-  } finally { await w.close(); }
-});

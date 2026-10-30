@@ -1,6 +1,11 @@
 export type Config = {
   /** 'dev-defaults' = PROVISIONAL policy values nobody has agreed. 'explicit' = every policy value was set by the operator. */
   policySource: 'dev-defaults' | 'explicit';
+  /** Exact JWT `sub` of the deployment owner's verified auth user (paired with the pinned AUTH_ISSUER).
+   *  Gates complaint-linked private data (photos, route narrative, org ids, events, disputes, scorecards).
+   *  OPTIONAL and fail-closed: when unset, NO principal gets owner access. Set by the deployment owner
+   *  after verifying the exact auth.users.id out of band - never inferred from email or roles. */
+  mainAdminSubject?: string;
   authIssuer: string;
   authAudience: string;
   authJwksUrl?: string;
@@ -100,5 +105,6 @@ export function fromEnv(env = process.env): Config {
     publicScorecards: env.PUBLIC_SCORECARDS === 'true',
     photoRequired: env.PHOTO_REQUIRED === 'true',
     followupPipeline: env.FOLLOWUP_PIPELINE === 'true',
+    mainAdminSubject: env.MAIN_ADMIN_SUBJECT?.trim() || undefined,
   } as Config;
 }

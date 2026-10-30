@@ -1,6 +1,6 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { newWorld, seed, client, sign, wrongKeyToken, reportBody, jpeg, P_WARRANTY, P_UTILITY, P_EXPIRED, P_NOROAD, type World } from './helpers.ts';
+import { newWorld, seed, client, sign, wrongKeyToken, mainAdmin, reportBody, jpeg, P_WARRANTY, P_UTILITY, P_EXPIRED, P_NOROAD, type World } from './helpers.ts';
 
 let w: World; let s: Awaited<ReturnType<typeof seed>>; const clock = { t: Date.now() };
 before(async () => { w = await newWorld({}, clock); s = await seed(w); });
@@ -52,18 +52,25 @@ test('registry import validates and is scoped to the municipality admin', async 
 
 test('routing: warranty, utility precedence, expired, unknown road, severity deadlines', async () => {
   const a = await citizen('r-a');
+  const mad = await mainAdmin(w);
   const warr = (await report(a, P_WARRANTY)).json.issue;
-  assert.equal(warr.status, 'assigned'); assert.equal(warr.responsible.kind, 'contractor'); assert.equal(warr.responsible.name, 'Sharma Infra'); assert.equal(warr.copy_org, 'Test Municipality');
-  const days = (new Date(warr.deadline_at).getTime() - clock.t) / 86400000; assert.ok(Math.abs(days - 7) < 0.01);
+  assert.equal(warr.status, 'assigned'); assert.equal(warr.responsible.kind, 'contractor');
+  assert.equal(warr.responsible.name, undefined); // settled policy: contractor NAME is complaint-linked targeting, owner-only
+  const warrOwner = (await mad.get(`/v1/issues/${warr.id}`)).json;
+  assert.equal(warrOwner.responsible.name, 'Sharma Infra');
+  assert.equal(warr.copy_org, undefined); // copy_org is an owner-only private field now
+  assert.equal(warrOwner.copy_org, 'Test Municipality');
+  const days = (new Date(warr.deadline_at).getTime() - clock.t) / 86400000; assert.ok(Math.abs(days - 7) < 0.01); // deadline carries no identity: public
   const b = await citizen('r-b');
   const util = (await report(b, P_UTILITY)).json.issue;
-  assert.equal(util.responsible.kind, 'utility'); assert.equal(util.responsible.name, 'Test Telecom'); // utility beats an active warranty on the same road
+  assert.equal(util.responsible.kind, 'utility');
+  assert.equal((await mad.get(`/v1/issues/${util.id}`)).json.responsible.name, 'Test Telecom'); // utility beats an active warranty on the same road
   const c = await citizen('r-c');
   const exp = (await report(c, P_EXPIRED)).json.issue;
   assert.equal(exp.responsible.kind, 'municipality'); assert.deepEqual(exp.route_flags, []);
   const d = await citizen('r-d');
   const none = (await report(d, P_NOROAD)).json.issue;
-  assert.equal(none.responsible.kind, 'municipality'); assert.deepEqual(none.route_flags, ['road_not_in_registry']);
+  assert.equal(none.responsible.kind, 'municipality'); assert.deepEqual(none.route_flags, ['road_not_in_registry']); // code-only flags, no identities
   const e = await citizen('r-e');
   const hi = (await report(e, { lat: 30.7399, lon: 76.7051 }, { hazard: 'missing_cover', danger: true })).json.issue; // 3 + 2 = severity 5 on the expired-warranty road
   assert.equal(hi.severity, 5);
@@ -152,7 +159,9 @@ test('repair workflow: location-checked proof, eligibility, two confirmations, a
   assert.equal((await r2.c.post(`/v1/issues/${id}/confirm`, { is_fixed: true })).json.status, 'fixed');
   const detail = (await r1.c.get(`/v1/issues/${id}`)).json;
   assert.equal(detail.status, 'fixed');
-  assert.deepEqual(detail.events.map((e: any) => e.kind).filter((k: string) => ['created', 'auto_verified', 'routed', 'started', 'repair_submitted', 'fixed_by_citizens'].includes(k)), ['created', 'auto_verified', 'routed', 'started', 'repair_submitted', 'fixed_by_citizens']);
+  assert.equal(detail.events, undefined); // event history is owner-only (settled privacy policy)
+  const ownerDetail = (await (await mainAdmin(w)).get(`/v1/issues/${id}`)).json;
+  assert.deepEqual(ownerDetail.events.map((e: any) => e.kind).filter((k: string) => ['created', 'auto_verified', 'routed', 'started', 'repair_submitted', 'fixed_by_citizens'].includes(k)), ['created', 'auto_verified', 'routed', 'started', 'repair_submitted', 'fixed_by_citizens']);
   const pts = (await w.adminDb.query(`SELECT reason, delta FROM points_ledger WHERE user_id=$1 ORDER BY id`, [r2.id])).rows.map((x) => x.reason);
   assert.ok(pts.includes('confirmed_fix') && pts.includes('verified_report'));
   // audit trail is append-only even for the API's DB role
@@ -179,7 +188,7 @@ test('rejected repair reopens with a fresh deadline; municipal approval/rejectio
   assert.equal((await s.contractor.c.post(`/v1/issues/${x.id}/municipal-decision`, { decision: 'approve', reason: 'I did it really' })).status, 404);
   const ok = await s.officer.c.post(`/v1/issues/${x.id}/municipal-decision`, { decision: 'approve', reason: 'Site inspected by officer' });
   assert.equal(ok.json.status, 'fixed');
-  const kinds = (await s.officer.c.get(`/v1/issues/${x.id}`)).json.events.map((e: any) => e.kind);
+  const kinds = (await (await mainAdmin(w)).get(`/v1/issues/${x.id}`)).json.events.map((e: any) => e.kind);
   assert.ok(kinds.includes('reopened') && kinds.includes('fixed_by_municipal_approval'));
 });
 
@@ -214,11 +223,14 @@ test('disputes: window, who may raise, officer decision re-routes, evidence owne
   assert.equal(d.status, 201);
   assert.equal((await s.contractor.c.post(`/v1/issues/${iss.id}/dispute`, { reason: 'Telecom trench cut here again' })).status, 409);
   assert.equal((await s.contractor.c.post(`/v1/disputes/${d.json.dispute_id}/decide`, { decision: 'upheld', reason: 'I decide for myself' })).status, 404);
-  // dispute id is discoverable by authorised staff only; reporters and other orgs never get it
+  // settled privacy policy: dispute ids and narrative are owner-only - staff, contractors and reporters
+  // all get the minimal public payload (see KNOWN_GAPS: staff dispute discoverability moved to the owner)
   const sv = (await s.officer.c.get(`/v1/issues/${iss.id}`)).json;
-  assert.equal(sv.disputes.length, 1); assert.equal(sv.disputes[0].id, d.json.dispute_id); assert.equal(sv.disputes[0].status, 'open');
-  assert.ok(sv.responsible_org_id && 'copy_org_id' in sv && 'review_org_id' in sv);
-  assert.equal((await s.contractor.c.get(`/v1/issues/${iss.id}`)).json.disputes[0].id, d.json.dispute_id);
+  assert.equal(sv.disputes, undefined); assert.equal(sv.responsible_org_id, undefined); assert.ok(!('copy_org_id' in sv) && !('review_org_id' in sv));
+  assert.equal((await s.contractor.c.get(`/v1/issues/${iss.id}`)).json.disputes, undefined);
+  const od = (await (await mainAdmin(w)).get(`/v1/issues/${iss.id}`)).json;
+  assert.equal(od.disputes.length, 1); assert.equal(od.disputes[0].id, d.json.dispute_id); assert.equal(od.disputes[0].status, 'open');
+  assert.ok(od.responsible_org_id && 'copy_org_id' in od && 'review_org_id' in od);
   const rv = (await r.c.get(`/v1/issues/${iss.id}`)).json;
   assert.equal(rv.disputes, undefined); assert.ok(!JSON.stringify(rv).includes(d.json.dispute_id));
   assert.equal((await other.c.get(`/v1/issues/${iss.id}`)).status, 404);
@@ -228,7 +240,8 @@ test('disputes: window, who may raise, officer decision re-routes, evidence owne
   const dec = await s.officer.c.post(`/v1/disputes/${d.json.dispute_id}/decide`, { decision: 'upheld', reason: 'Utility cut log confirms trench' });
   assert.equal(dec.status, 200);
   const after = (await s.officer.c.get(`/v1/issues/${iss.id}`)).json;
-  assert.equal(after.responsible.kind, 'municipality'); assert.equal(after.route_overridden, true);
+  assert.equal(after.responsible.kind, 'municipality');
+  assert.equal((await (await mainAdmin(w)).get(`/v1/issues/${iss.id}`)).json.route_overridden, true);
   assert.equal((await s.officer.c.post(`/v1/disputes/${d.json.dispute_id}/decide`, { decision: 'rejected', reason: 'Changing my mind later' })).status, 409);
   // window: a fresh issue, 49 hours later
   const iss2 = (await report(await citizen('dp-r2'), { lat: 30.7000, lon: 76.7092 })).json.issue;
@@ -242,7 +255,9 @@ test('route override needs a reason and municipal staff of that issue', async ()
   assert.equal((await s.contractor.c.post(`/v1/issues/${iss.id}/override-route`, { org_id: s.muni, reason: 'Take it back please' })).status, 404);
   assert.equal((await s.officer.c.post(`/v1/issues/${iss.id}/override-route`, { org_id: s.utilityOrg, reason: 'Gas utility trench seen on site' })).status, 200);
   const d = (await s.officer.c.get(`/v1/issues/${iss.id}`)).json;
-  assert.equal(d.responsible.kind, 'utility'); assert.ok(d.events.some((e: any) => e.kind === 'route_override' && e.reason.includes('Gas utility')));
+  assert.equal(d.responsible.kind, 'utility'); assert.equal(d.events, undefined); // events are owner-only
+  const od2 = (await (await mainAdmin(w)).get(`/v1/issues/${iss.id}`)).json;
+  assert.ok(od2.events.some((e: any) => e.kind === 'route_override' && e.reason.includes('Gas utility')));
 });
 
 test('escalation records are idempotent and never delivered', async () => {
@@ -278,7 +293,9 @@ test('public endpoints expose no reporter, evidence or exact coordinates; scorec
   assert.equal((await w.app.inject({ method: 'GET', url: '/v1/public/scorecards' })).statusCode, 404);
   assert.equal((await w.app.inject({ method: 'GET', url: '/v1/leaderboard' })).statusCode, 401);
   assert.equal((await w.app.inject({ method: 'GET', url: '/v1/public/issues/not-a-uuid' })).statusCode, 400);
-  assert.equal((await s.officer.c.get('/v1/admin/scorecards')).status, 200);
+  assert.equal((await s.officer.c.get('/v1/admin/scorecards')).status, 403); // complaint-linked contractor performance is owner-only now
+  assert.equal((await s.admin.c.get('/v1/admin/scorecards')).status, 403);   // municipal admin ROLE is not the owner principal
+  assert.equal((await (await mainAdmin(w)).get('/v1/admin/scorecards')).status, 200);
   assert.equal((await u.c.get('/v1/admin/scorecards')).status, 403);
 });
 
@@ -298,8 +315,9 @@ test('evidence: validated by content, metadata stripped, private to participants
   assert.ok(!got.raw.includes(Buffer.from('SECRET-TEST-TAG')));
   assert.equal((await stranger.c.get(`/v1/issues/${iss.id}/evidence/${up.json.evidence_id}`)).status, 404);
   assert.equal((await w.app.inject({ method: 'GET', url: `/v1/issues/${iss.id}/evidence/${up.json.evidence_id}` })).statusCode, 401);
-  assert.equal((await s.contractor.c.get(`/v1/issues/${iss.id}/evidence/${up.json.evidence_id}`)).status, 200);
-  assert.equal(((await r.c.get(`/v1/issues/${iss.id}`)).json.redaction).startsWith('none'), true);
+  assert.equal((await s.contractor.c.get(`/v1/issues/${iss.id}/evidence/${up.json.evidence_id}`)).status, 404); // assignee role is not a photo grant
+  assert.equal((await (await mainAdmin(w)).get(`/v1/issues/${iss.id}/evidence/${up.json.evidence_id}`)).status, 200); // exact owner principal
+  assert.equal(((await (await mainAdmin(w)).get(`/v1/issues/${iss.id}`)).json.redaction).startsWith('none'), true);
 });
 
 test('tenant isolation: another contractor cannot see or act on an issue', async () => {
