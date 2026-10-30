@@ -36,9 +36,10 @@
  * revoke either COMMITS before the sweep's lock (sweep sees it, no send) or blocks until the
  * sweep commits (send already finished; revoke returns after). A revoke can never observe 200
  * and still have a send happen afterwards, and a concurrent stop is never overwritten.
- * Future provider scope: the send call happens inside this transaction; a real provider MUST
- * keep this window small or move to a claim-token design - the conditional writes already
- * guarantee no state corruption either way.
+ * Future provider scope: the NoProvider send call is instant, so holding these locks across it
+ * is safe HERE. This design is NOT a promise for a real provider: that integration must be
+ * re-reviewed on its own (claim-token or equivalent), and it remains a separate authorized
+ * scope. The conditional writes guarantee no state corruption regardless.
  *
  * Verified recipient: Principal.email is set ONLY when the issuer's token carries an explicit
  * verified marker (email_verified === true, top-level or user_metadata). Supabase access

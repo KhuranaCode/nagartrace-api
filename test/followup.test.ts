@@ -319,10 +319,14 @@ test('regression: unverified email claims are rejected; only issuer-verified ema
   const i2 = await mkIssue(noFlag);
   await consent(noFlag);
   assert.equal((await create(noFlag, i2, 'k-' + uniq(), 'n@example.in')).status, 400);
-  const metaFlag = await mk({ email: 'm@example.in', user_metadata: { email_verified: true } }); // issuer marker in user_metadata
+  const metaFlag = await mk({ email: 'm@example.in', user_metadata: { email_verified: true } }); // user_metadata is USER-EDITABLE: not proof
   const i3 = await mkIssue(metaFlag);
   await consent(metaFlag);
-  assert.equal((await create(metaFlag, i3, 'k-' + uniq(), 'm@example.in')).status, 201);
+  assert.equal((await create(metaFlag, i3, 'k-' + uniq(), 'm@example.in')).status, 400, 'user-editable metadata flag must never bind an address');
+  const topLevel = await mk({ email: 'v@example.in', email_verified: true }); // issuer-owned top-level marker
+  const i4 = await mkIssue(topLevel);
+  await consent(topLevel);
+  assert.equal((await create(topLevel, i4, 'k-' + uniq(), 'v@example.in')).status, 201);
 });
 
 test('regression: identical HTML replay returns 200 same campaign; canonical hash beats jsonb key order', async () => {
