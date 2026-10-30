@@ -4,7 +4,7 @@ import { z } from 'zod';
 import type pg from 'pg';
 import type { Config } from './config.ts';
 import { authenticate, HttpError, memberships, type KeyResolver, type Membership, type Principal } from './auth.ts';
-import { laptopAiStatus, reportCheck, LaptopAiError } from './laptop-ai.ts';
+import { admitReportCheck, laptopAiStatus, reportCheck, LaptopAiError } from './laptop-ai.ts';
 import { awardPoints, deadlineHours, lockIssue, recordEvent, routeIssue, runEscalations, severityOf, transition } from './domain.ts';
 import { registerStreakRoutes } from './streaks.ts';
 import { registerFollowupRoutes } from './followup.ts';
@@ -195,21 +195,30 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
     return laptopAiStatus({ url: cfg.laptopAiUrl, token: cfg.laptopAiToken, model: cfg.laptopAiModel, timeoutMs: cfg.laptopAiTimeoutMs });
   });
 
-  app.post('/v1/ai/report-check', async (req, reply) => {
-    await auth(req);
+  app.post('/v1/ai/report-check', { bodyLimit: 8 * 1024 }, async (req, reply) => {
+    const principal = await auth(req);
+    const budget = admitReportCheck(principal.userId);
+    if (!budget.ok) return reply.code(503).send({ ai_available: false, reason: budget.reason });
     const b = (req.body ?? {}) as { hazard?: string; note?: string; lat?: number; lon?: number; ward?: string };
-    if (typeof b.hazard !== 'string' || typeof b.lat !== 'number' || typeof b.lon !== 'number') {
-      throw new HttpError(400, 'hazard, lat and lon are required.', 'bad_request');
+    const hazardOk = typeof b.hazard === 'string' && (HAZARDS as readonly string[]).includes(b.hazard);
+    const latOk = typeof b.lat === 'number' && Number.isFinite(b.lat) && b.lat >= -90 && b.lat <= 90;
+    const lonOk = typeof b.lon === 'number' && Number.isFinite(b.lon) && b.lon >= -180 && b.lon <= 180;
+    if (!hazardOk || !latOk || !lonOk) {
+      throw new HttpError(400, 'hazard (known type), lat (-90..90) and lon (-180..180) are required.', 'bad_request');
     }
+    if (b.note !== undefined && (typeof b.note !== 'string' || b.note.length > 2000)) throw new HttpError(400, 'note too long.', 'bad_request');
+    if (b.ward !== undefined && (typeof b.ward !== 'string' || b.ward.length > 120)) throw new HttpError(400, 'ward too long.', 'bad_request');
     try {
       const advisory = await reportCheck({ url: cfg.laptopAiUrl, token: cfg.laptopAiToken, model: cfg.laptopAiModel, timeoutMs: cfg.laptopAiTimeoutMs },
-        { hazard: b.hazard, note: typeof b.note === 'string' ? b.note.slice(0, 2000) : undefined, lat: b.lat, lon: b.lon, ward: typeof b.ward === 'string' ? b.ward : undefined });
+        { hazard: b.hazard!, note: b.note, lat: b.lat!, lon: b.lon!, ward: b.ward });
       return { ai_available: true, advisory };
     } catch (e) {
       if (e instanceof LaptopAiError) {
         return reply.code(503).send({ ai_available: false, reason: e.reason });
       }
       throw e;
+    } finally {
+      budget.done();
     }
   });
 

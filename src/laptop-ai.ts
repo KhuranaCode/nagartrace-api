@@ -5,12 +5,15 @@
  * fabricate a suggestion. No public unauthenticated inference: every route
  * here requires a signed-in user.
  *
- * The laptop endpoint speaks Ollama's /api/chat. SECURITY REALITY: stock
- * Ollama ignores Authorization headers - the bearer token here is NOT what
- * protects it. LAPTOP_AI_URL must point at an authenticating gateway in
- * front of Ollama (e.g. cloudflared with Cloudflare Access, or a reverse
- * proxy that checks LAPTOP_AI_TOKEN before proxying). Never point this at
- * a raw, publicly reachable Ollama port.
+ * SECURITY MODEL (enforced below, not just documented):
+ * - The laptop endpoint speaks Ollama's /api/chat. Stock Ollama ignores
+ *   Authorization headers, so LAPTOP_AI_URL must point at an authenticating
+ *   gateway in front of Ollama (e.g. cloudflared with Cloudflare Access, or
+ *   a reverse proxy that checks LAPTOP_AI_TOKEN before proxying).
+ * - We therefore REFUSE unsafe config: https-only URLs and a required token.
+ * - We never follow redirects (a redirect could carry the token elsewhere).
+ * - The timeout covers the WHOLE exchange, headers and body - a slow-loris
+ *   body cannot hang a worker.
  * Not configured = the feature is off, reported as such.
  */
 
@@ -31,22 +34,35 @@ export type Advisory = {
 };
 
 export class LaptopAiError extends Error {
-  constructor(public reason: 'not_configured' | 'laptop_unreachable' | 'timeout' | 'bad_output', message: string) {
+  constructor(public reason: 'not_configured' | 'misconfigured' | 'laptop_unreachable' | 'timeout' | 'bad_output', message: string) {
     super(message);
   }
 }
 
-function headers(token?: string): Record<string, string> {
-  const h: Record<string, string> = { 'content-type': 'application/json' };
-  if (token) h.authorization = `Bearer ${token}`;
-  return h;
+/** Config must be explicitly safe: https URL + bearer token for the gateway. Anything else is off. */
+export function validateLaptopAiConfig(cfg: LaptopAiConfig): { ok: true; base: string } | { ok: false; reason: 'not_configured' | 'misconfigured' } {
+  if (!cfg.url) return { ok: false, reason: 'not_configured' };
+  let u: URL;
+  try { u = new URL(cfg.url); } catch { return { ok: false, reason: 'misconfigured' }; }
+  if (u.protocol !== 'https:') return { ok: false, reason: 'misconfigured' }; // no plain HTTP, no raw Ollama port
+  if (!cfg.token) return { ok: false, reason: 'misconfigured' }; // gateway secret required
+  if (!cfg.model) return { ok: false, reason: 'misconfigured' };
+  return { ok: true, base: cfg.url.replace(/\/+$/, '') };
 }
 
-async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+function headers(token: string): Record<string, string> {
+  return { 'content-type': 'application/json', authorization: `Bearer ${token}` };
+}
+
+/** fetch + FULL body read under one abort clock; redirects are errors, never followed. */
+async function fetchTextWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<{ status: number; body: string }> {
   const ac = new AbortController();
   const t = setTimeout(() => ac.abort(), timeoutMs);
   try {
-    return await fetch(url, { ...init, signal: ac.signal });
+    const res = await fetch(url, { ...init, signal: ac.signal, redirect: 'error' });
+    const body = await res.text(); // still under the clock: body dribble cannot outlive the timeout
+    if (body.length > 1024 * 1024) throw new LaptopAiError('bad_output', 'laptop response exceeded 1MB cap');
+    return { status: res.status, body };
   } catch (e: any) {
     if (e?.name === 'AbortError') throw new LaptopAiError('timeout', 'laptop inference timed out');
     throw new LaptopAiError('laptop_unreachable', `laptop endpoint unreachable: ${e?.message ?? e}`);
@@ -55,24 +71,89 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
   }
 }
 
-/** Cheap reachability probe: configured + Ollama answers /api/tags. */
+/** Reachability probe: safe config + Ollama answers /api/tags AND the configured model is actually pulled. */
 export async function laptopAiStatus(cfg: LaptopAiConfig): Promise<{ configured: boolean; available: boolean; model?: string; reason?: string }> {
-  if (!cfg.url) return { configured: false, available: false, reason: 'not_configured' };
+  const v = validateLaptopAiConfig(cfg);
+  if (!v.ok) return { configured: v.reason === 'misconfigured', available: false, reason: v.reason };
   try {
-    const res = await fetchWithTimeout(`${cfg.url.replace(/\/$/, '')}/api/tags`, { headers: headers(cfg.token) }, Math.min(cfg.timeoutMs, 5000));
-    if (!res.ok) return { configured: true, available: false, reason: `laptop_http_${res.status}` };
+    const r = await fetchTextWithTimeout(`${v.base}/api/tags`, { headers: headers(cfg.token!) }, Math.min(cfg.timeoutMs, 5000));
+    if (r.status === 401 || r.status === 403) return { configured: true, available: false, reason: 'gateway_auth_refused' };
+    if (r.status !== 200) return { configured: true, available: false, reason: `laptop_http_${r.status}` };
+    let tags: any;
+    try { tags = JSON.parse(r.body); } catch { return { configured: true, available: false, reason: 'bad_output' }; }
+    const models: string[] = Array.isArray(tags?.models) ? tags.models.map((m: any) => String(m?.name ?? '')) : [];
+    if (!models.some((n) => n === cfg.model || n.startsWith(cfg.model + ':') || cfg.model.startsWith(n + ':'))) {
+      return { configured: true, available: false, reason: 'model_missing', model: cfg.model };
+    }
     return { configured: true, available: true, model: cfg.model };
   } catch (e: any) {
     return { configured: true, available: false, reason: e instanceof LaptopAiError ? e.reason : 'laptop_unreachable' };
   }
 }
 
-const SYSTEM = `You are the NagarTrace report assistant. A citizen has filed a civic road-hazard report. Reply with ONLY a JSON object, no prose, exactly this shape:
+
+/**
+ * In-process budgets (per backend instance; Render runs one). Not a security boundary -
+ * a restart resets them - but they stop a single user or a burst from queueing unbounded
+ * laptop inference. 5 checks per user per 10 minutes; at most 2 upstream calls in flight.
+ */
+const perUser = new Map<string, number[]>();
+let inFlight = 0;
+const USER_WINDOW_MS = 10 * 60 * 1000;
+const USER_MAX = 5;
+const INFLIGHT_MAX = 2;
+
+export function admitReportCheck(userId: string): { ok: true; done: () => void } | { ok: false; reason: 'rate_limited' | 'busy' } {
+  const now = Date.now();
+  const arr = (perUser.get(userId) ?? []).filter((t) => now - t < USER_WINDOW_MS);
+  if (arr.length >= USER_MAX) { perUser.set(userId, arr); return { ok: false, reason: 'rate_limited' }; }
+  if (inFlight >= INFLIGHT_MAX) return { ok: false, reason: 'busy' };
+  arr.push(now);
+  perUser.set(userId, arr);
+  inFlight += 1;
+  let closed = false;
+  return { ok: true, done: () => { if (!closed) { closed = true; inFlight -= 1; } } };
+}
+
+const SYSTEM = `You are the NagarTrace report assistant. A citizen is DRAFTING a civic road-hazard report and has not submitted it yet. You advise the drafter only - you do not address authorities and nothing you say is sent anywhere else. Reply with ONLY a JSON object, no prose, exactly this shape:
 {"summary": string, "severity_hint": "low"|"medium"|"high"|null, "suggested_hazard": string|null, "missing_details": string[]}
 Rules: never claim the report is verified. Never invent facts not in the input. If the note is too thin to judge, say so in missing_details. Keep summary under 40 words.`;
 
+const HAZARD_KEYS = ['pothole', 'crack', 'waterlogging', 'broken_edge', 'missing_cover', 'other'];
+
+/** Strict shape check on model output; anything odd is bad_output, never a partial pass. */
+function parseAdvisory(raw: string, model: string): Advisory {
+  let parsed: any;
+  try { parsed = JSON.parse(raw); } catch { throw new LaptopAiError('bad_output', 'model reply was not JSON'); }
+  if (typeof parsed?.summary !== 'string' || parsed.summary.trim().length === 0 || parsed.summary.length > 500) {
+    throw new LaptopAiError('bad_output', 'model reply missing/bad summary');
+  }
+  const sev = parsed.severity_hint;
+  if (sev !== undefined && sev !== null && sev !== 'low' && sev !== 'medium' && sev !== 'high') {
+    throw new LaptopAiError('bad_output', 'severity_hint outside the allowed enum');
+  }
+  // suggested_hazard passes through ONLY as a known hazard key; invented labels are dropped.
+  let hazard: string | null = null;
+  if (typeof parsed.suggested_hazard === 'string') {
+    const h = parsed.suggested_hazard.trim().toLowerCase();
+    if (HAZARD_KEYS.includes(h)) hazard = h;
+  }
+  const missing = Array.isArray(parsed.missing_details)
+    ? parsed.missing_details.filter((x: any) => typeof x === 'string' && x.length > 0 && x.length <= 120).slice(0, 5)
+    : [];
+  return {
+    summary: parsed.summary.trim(),
+    severity_hint: sev ?? null,
+    suggested_hazard: hazard,
+    missing_details: missing,
+    model,
+    advisory: true,
+  };
+}
+
 export async function reportCheck(cfg: LaptopAiConfig, input: { hazard: string; note?: string; lat: number; lon: number; ward?: string }): Promise<Advisory> {
-  if (!cfg.url) throw new LaptopAiError('not_configured', 'laptop AI endpoint is not configured');
+  const v = validateLaptopAiConfig(cfg);
+  if (!v.ok) throw new LaptopAiError(v.reason, v.reason === 'not_configured' ? 'laptop AI endpoint is not configured' : 'laptop AI endpoint config is not safe (https URL + gateway token required)');
   const body = {
     model: cfg.model,
     stream: false,
@@ -82,21 +163,12 @@ export async function reportCheck(cfg: LaptopAiConfig, input: { hazard: string; 
       { role: 'user', content: JSON.stringify({ hazard: input.hazard, note: input.note ?? '', lat: input.lat, lon: input.lon, ward: input.ward ?? null }) },
     ],
   };
-  const res = await fetchWithTimeout(`${cfg.url.replace(/\/$/, '')}/api/chat`, { method: 'POST', headers: headers(cfg.token), body: JSON.stringify(body) }, cfg.timeoutMs);
-  if (!res.ok) throw new LaptopAiError('laptop_unreachable', `laptop returned HTTP ${res.status}`);
-  const data: any = await res.json().catch(() => null);
+  const r = await fetchTextWithTimeout(`${v.base}/api/chat`, { method: 'POST', headers: headers(cfg.token!), body: JSON.stringify(body) }, cfg.timeoutMs);
+  if (r.status === 401 || r.status === 403) throw new LaptopAiError('misconfigured', 'gateway refused the configured token');
+  if (r.status !== 200) throw new LaptopAiError('laptop_unreachable', `laptop returned HTTP ${r.status}`);
+  let data: any;
+  try { data = JSON.parse(r.body); } catch { throw new LaptopAiError('bad_output', 'ollama envelope was not JSON'); }
   const content = data?.message?.content;
   if (typeof content !== 'string') throw new LaptopAiError('bad_output', 'no message content from model');
-  let parsed: any;
-  try { parsed = JSON.parse(content); } catch { throw new LaptopAiError('bad_output', 'model reply was not JSON'); }
-  if (typeof parsed?.summary !== 'string' || parsed.summary.length === 0) throw new LaptopAiError('bad_output', 'model reply missing summary');
-  const sev = parsed.severity_hint;
-  return {
-    summary: parsed.summary.slice(0, 500),
-    severity_hint: sev === 'low' || sev === 'medium' || sev === 'high' ? sev : null,
-    suggested_hazard: typeof parsed.suggested_hazard === 'string' ? parsed.suggested_hazard : null,
-    missing_details: Array.isArray(parsed.missing_details) ? parsed.missing_details.filter((x: any) => typeof x === 'string').slice(0, 5) : [],
-    model: cfg.model,
-    advisory: true,
-  };
+  return parseAdvisory(content, cfg.model);
 }
