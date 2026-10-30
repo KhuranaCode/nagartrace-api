@@ -22,7 +22,7 @@ export async function sign(sub: string, o: { iss?: string; aud?: string; exp?: s
 }
 export const wrongKeyToken = (sub: string) => sign(sub, { key: other.privateKey });
 
-export async function newWorld(over: Partial<Config> = {}, clock?: { t: number }) {
+export async function newWorld(over: Partial<Config> = {}, clock?: { t: number }, store?: import('../src/storage.ts').BlobStore) {
   const name = 'nt_' + crypto.randomBytes(5).toString('hex');
   const owner = new pg.Client({ connectionString: OWNER }); await owner.connect();
   await owner.query(`CREATE DATABASE ${name}`); await owner.end();
@@ -32,7 +32,7 @@ export async function newWorld(over: Partial<Config> = {}, clock?: { t: number }
   const adminDb = new pg.Pool({ connectionString: base, max: 2 });
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ntblob-'));
   const cfg: Config = { ...defaults(), authIssuer: ISSUER, authAudience: AUDIENCE, databaseUrl: base, storageDir: dir, confirmMinAccountAgeHours: 0, rateLimitMax: 100000, verificationMode: 'auto_checks', ...over };
-  const app = await buildApp({ cfg, db: runtime, keys: kp.publicKey, store: localStore(dir), now: clock ? () => new Date(clock.t) : undefined });
+  const app = await buildApp({ cfg, db: runtime, keys: kp.publicKey, store: store ?? localStore(dir), now: clock ? () => new Date(clock.t) : undefined });
   return {
     app, runtime, adminDb, cfg,
     async close() { await app.close(); await runtime.end(); await adminDb.end(); const o = new pg.Client({ connectionString: OWNER }); await o.connect(); await o.query(`DROP DATABASE ${name} WITH (FORCE)`); await o.end(); },

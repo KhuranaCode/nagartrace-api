@@ -101,6 +101,81 @@
     }
    }
   },
+  "/v1/uploads/stage": {
+   "post": {
+    "summary": "Stage a report photo (private, 1 h expiry; bind with photo_upload_id in POST /v1/reports)",
+    "security": [
+     {
+      "bearer": []
+     }
+    ],
+    "parameters": [
+     {
+      "name": "lat",
+      "in": "query",
+      "required": true,
+      "schema": {
+       "type": "number",
+       "minimum": -90,
+       "maximum": 90
+      },
+      "description": "Reporter's GPS latitude at capture (a claim, verified against the report location at binding; NOT read from photo metadata)"
+     },
+     {
+      "name": "lon",
+      "in": "query",
+      "required": true,
+      "schema": {
+       "type": "number",
+       "minimum": -180,
+       "maximum": 180
+      },
+      "description": "Reporter's GPS longitude at capture"
+     }
+    ],
+    "requestBody": {
+     "required": true,
+     "content": {
+      "image/jpeg": {
+       "schema": {
+        "type": "string",
+        "format": "binary"
+       }
+      },
+      "image/png": {
+       "schema": {
+        "type": "string",
+        "format": "binary"
+       }
+      },
+      "image/webp": {
+       "schema": {
+        "type": "string",
+        "format": "binary"
+       }
+      }
+     },
+     "description": "Raw image bytes, max 8 MB. Re-encoded to JPEG; all metadata incl. EXIF GPS is stripped."
+    },
+    "responses": {
+     "201": {
+      "description": "{upload_id, expires_at} - bind within 1 hour"
+     },
+     "413": {
+      "description": "{error: bad_image} - empty or over 8 MB"
+     },
+     "415": {
+      "description": "{error: bad_image} - not a JPEG/PNG/WebP image"
+     },
+     "422": {
+      "description": "{error: bad_image} - undecodable image"
+     },
+     "429": {
+      "description": "{error: too_many_staged|rate_limited} - 5 unbound waiting or 30 stages/hour per account"
+     }
+    }
+   }
+  },
   "/v1/reports": {
    "post": {
     "summary": "Submit report (Idempotency-Key header optional). Status stays 'reported' in officer_review mode",
@@ -115,6 +190,12 @@
      },
      "4XX": {
       "description": "{error,message}; hidden records return 404"
+     },
+     "422": {
+      "description": "{error: stale_report|poor_gps|photo_required|invalid_upload|location_mismatch}"
+     },
+     "429": {
+      "description": "{error: daily_cap}"
      }
     },
     "requestBody": {
@@ -161,6 +242,11 @@
          "captured_at": {
           "type": "string",
           "format": "date-time"
+         },
+         "photo_upload_id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "Staged photo id from POST /v1/uploads/stage. Bound atomically with the report; required when the deployment sets PHOTO_REQUIRED=true."
          }
         }
        }

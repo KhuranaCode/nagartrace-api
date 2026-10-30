@@ -129,6 +129,24 @@ test('photo-mandatory reports: stage + atomic bind, guards and failure modes', a
       assert.equal(det.json.evidence.length, 1);
     });
 
+    await t.test('location is checked against the REPORT, so a merge-boundary reporter is not falsely rejected', async () => {
+      // Issue at X; reporter B stands ~25 m away (inside the 30 m merge radius) and the
+      // photo is claimed ~25 m beyond B - about 50 m from the issue, beyond the 50 m
+      // issue-geom rule but within 50 m of B's report. Report-geom semantics must bind.
+      const base = { lat: P_NOROAD.lat + 0.2, lon: P_NOROAD.lon + 0.2 };
+      const s1 = await stage(wOn, uOn, base.lat, base.lon);
+      const r1 = await uOn.post('/v1/reports', reportBody(base, { photo_upload_id: s1.json.upload_id, hazard: 'pothole' }));
+      assert.equal(r1.status, 201);
+      const other = client(wOn, await userToken('citizen-boundary'));
+      const bSpot = { lat: base.lat + 0.00022, lon: base.lon }; // ~24 m north
+      const photoSpot = { lat: base.lat + 0.00044, lon: base.lon }; // ~49 m north of issue
+      const s2 = await stage(wOn, other, photoSpot.lat, photoSpot.lon);
+      const r2 = await other.post('/v1/reports', reportBody(bSpot, { photo_upload_id: s2.json.upload_id, hazard: 'pothole' }));
+      assert.equal(r2.status, 200);
+      assert.equal(r2.json.merged_into_existing, true);
+      assert.ok(r2.json.photo?.evidence_id);
+    });
+
     await t.test('merged report binds the photo to the EXISTING issue', async () => {
       const s1 = await stage(wOn, uOn, P_NOROAD.lat + 0.08, P_NOROAD.lon + 0.08);
       const r1 = await uOn.post('/v1/reports', reportBody({ lat: P_NOROAD.lat + 0.08, lon: P_NOROAD.lon + 0.08 }, { photo_upload_id: s1.json.upload_id, hazard: 'flooding' }));
@@ -183,6 +201,59 @@ test('photo-mandatory reports: stage + atomic bind, guards and failure modes', a
       assert.equal(r2.json.photo?.evidence_id, r1.json.photo?.evidence_id);
       const det = await uOn.get(`/v1/issues/${r1.json.issue.id}`);
       assert.equal(det.json.evidence.length, 1);
+    });
+
+    await t.test('staging limits: 6th unbound photo is 429, hourly cap is 429', async () => {
+      for (let i = 0; i < 5; i++) {
+        const r = await stage(wOn, uOn, P_NOROAD.lat + 0.3, P_NOROAD.lon + 0.3 + i * 0.001);
+        assert.equal(r.status, 201, `stage ${i}`);
+      }
+      const sixth = await stage(wOn, uOn, P_NOROAD.lat + 0.3, P_NOROAD.lon + 0.4);
+      assert.equal(sixth.status, 429);
+      assert.equal(sixth.json.error, 'too_many_staged');
+      // hourly cap: another account seeded with 30 staged rows in the last hour
+      const other = client(wOn, await userToken('citizen-flood'));
+      await other.get('/v1/me'); // materialises the account
+      const uid = (await wOn.adminDb.query(`SELECT id FROM users WHERE subject='citizen-flood'`)).rows[0].id;
+      for (let i = 0; i < 30; i++) {
+        await wOn.adminDb.query(
+          `INSERT INTO staged_uploads (uploader_id, storage_key, sha256, content_type, byte_size, width, height, claimed_geom, consumed_at)
+           VALUES ($1, $2, 'x', 'image/jpeg', 1, 1, 1, ST_SetSRID(ST_MakePoint(76,30),4326)::geography, now())`,
+          [uid, 'seed-' + i]);
+      }
+      const r = await stage(wOn, other, P_NOROAD.lat + 0.31, P_NOROAD.lon + 0.31);
+      assert.equal(r.status, 429);
+      assert.equal(r.json.error, 'rate_limited');
+    });
+
+    await t.test('concurrent stages from one account cannot exceed the pending cap', async () => {
+      const u3 = client(wOn, await userToken('citizen-parallel-stage'));
+      const results = await Promise.all(
+        Array.from({ length: 8 }, (_, i) => stage(wOn, u3, P_NOROAD.lat + 0.35, P_NOROAD.lon + 0.35 + i * 0.001)));
+      const ok = results.filter((r) => r.status === 201).length;
+      const capped = results.filter((r) => r.status === 429).length;
+      assert.equal(ok, 5);
+      assert.equal(capped, 3);
+    });
+
+    await t.test('failing store: sweep keeps the row and retries, API stays up', async () => {
+      const inner = (await import('../src/storage.ts')).localStore(wOn.cfg.storageDir!);
+      const flaky = { ...inner, del: async () => { throw new Error('store down'); } };
+      const wF = await newWorld({ photoRequired: true }, undefined, flaky);
+      try {
+        await seed(wF);
+        const uF = client(wF, await userToken('citizen-flaky'));
+        const s1 = await uF.upload(`/v1/uploads/stage?lat=${P_NOROAD.lat}&lon=${P_NOROAD.lon}`, await jpeg());
+        assert.equal(s1.status, 201);
+        await wF.adminDb.query(`UPDATE staged_uploads SET expires_at = now() - interval '1 minute' WHERE id=$1`, [s1.json.upload_id]);
+        // next stage triggers the sweep; the delete fails, so the row must SURVIVE for retry
+        const s2 = await uF.upload(`/v1/uploads/stage?lat=${P_NOROAD.lat}&lon=${P_NOROAD.lon}`, await jpeg());
+        assert.equal(s2.status, 201);
+        const kept = (await wF.adminDb.query('SELECT count(*)::int AS n FROM staged_uploads WHERE id=$1', [s1.json.upload_id])).rows[0].n;
+        assert.equal(kept, 1);
+      } finally {
+        await wF.close();
+      }
     });
 
     await t.test('bad image to stage is rejected like evidence uploads', async () => {
