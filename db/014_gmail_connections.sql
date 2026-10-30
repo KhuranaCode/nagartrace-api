@@ -22,7 +22,7 @@ CREATE TABLE authority_email (
   subject text NOT NULL,
   body_text text NOT NULL,
   body_sha256 text NOT NULL, -- exact-body proof: the reviewed bytes are the sent bytes
-  status text NOT NULL CHECK (status IN ('accepted','failed')),
+  status text NOT NULL CHECK (status IN ('accepted','failed','unknown')),
   gmail_message_id text,      -- present ONLY on a real API acceptance
   gmail_thread_id text,
   error text,

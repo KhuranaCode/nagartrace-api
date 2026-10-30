@@ -122,7 +122,7 @@ test('connect stores ONLY an encrypted token; status shows the connection', asyn
   assert.equal(st2.json.connected, true);
 });
 
-test('authority send: exact body sha stored, accepted-never-delivered, replay/idempotency, failed-no-autoretry', async () => {
+test('authority send: exact body sha stored, accepted-never-delivered, replay/idempotency, unknown/failed truth, no-autoretry', async () => {
   const c = await mk();
   await connect(c);
   const rep = await c.post('/v1/reports', reportBody({ lat: P_NOROAD.lat + 0.11, lon: P_NOROAD.lon + 0.11 }));
@@ -144,14 +144,26 @@ test('authority send: exact body sha stored, accepted-never-delivered, replay/id
   // changed payload, same key: 409
   const s3 = await c.post(`/v1/issues/${issueId}/authority-emails`, { ...body, body_text: 'Changed.' });
   assert.equal(s3.status, 409);
-  // Gmail 500: recorded 'failed', NO automatic retry (exactly one send call for this key)
+  // Gmail 500: outcome AMBIGUOUS -> recorded 'unknown', NO automatic retry (exactly one send call for this key)
   google.sendPlan = () => ({ status: 500, json: async () => ({}) });
   const sendsBefore2 = google.sendCalls;
   const s4 = await c.post(`/v1/issues/${issueId}/authority-emails`, { ...body, idempotency_key: 'gm-' + uniq() });
-  assert.equal(s4.status, 502); assert.equal(s4.json.status, 'failed');
+  assert.equal(s4.status, 502); assert.equal(s4.json.status, 'unknown');
   assert.equal(google.sendCalls, sendsBefore2 + 1);
-  const failed = (await w.adminDb.query(`SELECT status, gmail_message_id FROM authority_email WHERE id=$1`, [s4.json.email_id])).rows[0];
-  assert.equal(failed.status, 'failed'); assert.equal(failed.gmail_message_id, null);
+  const unk = (await w.adminDb.query(`SELECT status, gmail_message_id FROM authority_email WHERE id=$1`, [s4.json.email_id])).rows[0];
+  assert.equal(unk.status, 'unknown'); assert.equal(unk.gmail_message_id, null);
+  // Gmail definitive rejection (4xx): recorded 'failed'
+  google.sendPlan = () => ({ status: 403, json: async () => ({}) });
+  const s5 = await c.post(`/v1/issues/${issueId}/authority-emails`, { ...body, idempotency_key: 'gm-' + uniq() });
+  assert.equal(s5.status, 502); assert.equal(s5.json.status, 'failed');
+  // Transport failure (timeout): Gmail may have received it -> 'unknown'
+  google.sendPlan = () => { throw Object.assign(new Error('timed out'), { name: 'TimeoutError' }); };
+  const sendsBefore3 = google.sendCalls;
+  const s6 = await c.post(`/v1/issues/${issueId}/authority-emails`, { ...body, idempotency_key: 'gm-' + uniq() });
+  assert.equal(s6.status, 502); assert.equal(s6.json.status, 'unknown');
+  assert.equal(google.sendCalls, sendsBefore3 + 1, 'one attempt, never an automatic retry');
+  const unk2 = (await w.adminDb.query(`SELECT status, error FROM authority_email WHERE id=$1`, [s6.json.email_id])).rows[0];
+  assert.equal(unk2.status, 'unknown'); assert.equal(unk2.error, 'gmail_timeout');
   google.sendPlan = undefined;
 });
 

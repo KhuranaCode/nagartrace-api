@@ -11,7 +11,8 @@
  *  - Sending requires an EXACT reviewed body: the client shows the exact text, the request
  *    carries it, the server stores body_sha256 of the sent bytes. 'accepted' (Gmail API 200
  *    + message id) is never 'delivered'. An ambiguous send outcome (timeout/5xx without a
- *    message id) is recorded 'failed' with NO automatic retry - the user resends manually,
+ *    message id), or any ambiguous outcome (timeout, network error, 5xx) is recorded
+ *    'unknown' - with NO automatic retry; the user checks Gmail, then resends manually,
  *    and the idempotency key makes a manual retry safe (identical payload replays).
  */
 import { createHash, createHmac, randomBytes, randomUUID, createCipheriv, createDecipheriv, timingSafeEqual } from 'node:crypto';
@@ -192,20 +193,42 @@ export function registerGmailRoutes(app: FastifyInstance, deps: { cfg: Config; d
     if (!conn) throw new HttpError(409, 'Gmail is not connected. Connect your Gmail first.', 'gmail_not_connected');
     const raw = b64u(Buffer.from(
       `To: ${to}\r\nSubject: ${subject.replace(/[\r\n]/g, ' ')}\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n${body_text}`, 'utf8'));
-    const sr = await fetchImpl('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
-      method: 'POST', redirect: 'error', signal: AbortSignal.timeout(10000),
-      headers: { authorization: `Bearer ${conn.token}`, 'content-type': 'application/json' },
-      body: JSON.stringify({ raw }),
-    });
-    const sj: any = sr.status === 200 ? await sr.json() : null;
-    const accepted = sr.status === 200 && typeof sj?.id === 'string';
+    let sr: any = null;
+    let fetchThrew: string | null = null;
+    try {
+      sr = await fetchImpl('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
+        method: 'POST', redirect: 'error', signal: AbortSignal.timeout(10000),
+        headers: { authorization: `Bearer ${conn.token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ raw }),
+      });
+    } catch (e: any) {
+      // Timeout, DNS, socket reset: Gmail may still have received it. Truth = 'unknown'.
+      fetchThrew = e?.name === 'TimeoutError' ? 'gmail_timeout' : 'gmail_network_error';
+    }
+    // Outcome truthfulness: only a 200 with a message id proves Gmail ACCEPTED the message.
+    // A definitive client rejection (4xx) is 'failed'. Anything else - timeout, network error,
+    // 5xx, or an unexpected 200 body - is 'unknown': the message may or may not exist in Gmail.
+    // 'unknown' is never auto-retried; the user must check their Gmail before resending manually.
+    let status: 'accepted' | 'failed' | 'unknown';
+    let gmsgId: string | null = null, gthreadId: string | null = null, gerr: string | null = null;
+    if (fetchThrew) { status = 'unknown'; gerr = fetchThrew; } else try {
+      const sj: any = sr.status === 200 ? await sr.json() : null;
+      if (sr.status === 200 && typeof sj?.id === 'string') {
+        status = 'accepted'; gmsgId = sj.id;
+        if (typeof sj?.threadId === 'string') gthreadId = sj.threadId;
+      } else if (sr.status >= 400 && sr.status < 500) {
+        status = 'failed'; gerr = `gmail_http_${sr.status}`;
+      } else {
+        status = 'unknown'; gerr = `gmail_http_${sr.status}`;
+      }
+    } catch {
+      status = 'unknown'; gerr = 'gmail_response_unreadable';
+    }
     const ins = await db.query(
       `INSERT INTO authority_email (issue_id, sender_user_id, to_address, subject, body_text, body_sha256, status, gmail_message_id, gmail_thread_id, error, idempotency_key)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id`,
-      [issueId, p.userId, to, subject, body_text, bodySha, accepted ? 'accepted' : 'failed',
-       accepted ? sj.id : null, accepted && typeof sj?.threadId === 'string' ? sj.threadId : null,
-       accepted ? null : `gmail_http_${sr.status}`, idempotency_key]);
+      [issueId, p.userId, to, subject, body_text, bodySha, status, gmsgId, gthreadId, gerr, idempotency_key]);
     // 'accepted' = Gmail accepted the message (id returned). NEVER presented as delivered.
-    return reply.status(accepted ? 201 : 502).send({ email_id: ins.rows[0].id, status: accepted ? 'accepted' : 'failed', gmail_message_id: accepted ? sj.id : null });
+    return reply.status(status === 'accepted' ? 201 : 502).send({ email_id: ins.rows[0].id, status, gmail_message_id: gmsgId });
   });
 }
