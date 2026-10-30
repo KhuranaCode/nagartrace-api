@@ -1311,6 +1311,44 @@
      }
     }
    }
+  },
+  "/v1/public/gov-records/nhai-awards": {
+   "get": {
+    "summary": "Verbatim NHAI Awarded Projects FY2024-25 records (public government data, historical snapshot), filterable by state and NH number",
+    "security": [],
+    "parameters": [
+     {
+      "name": "state",
+      "in": "query",
+      "required": false,
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "name": "nh",
+      "in": "query",
+      "required": false,
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "required": false,
+      "schema": {
+       "type": "integer",
+       "maximum": 352
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "{awards: verbatim rows, dataset: {rows, source_label, coverage, anomaly_note}}"
+     }
+    }
+   }
   }
  }
 }

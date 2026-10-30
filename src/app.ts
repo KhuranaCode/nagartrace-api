@@ -9,6 +9,7 @@ import { registerStreakRoutes } from './streaks.ts';
 import { registerFollowupRoutes } from './followup.ts';
 import { normalizeImage } from './images.ts';
 import type { BlobStore } from './storage.ts';
+import { officialRecordsForPoint, nhaiAwardsBrowse } from './govrecords.ts';
 
 export type Deps = { cfg: Config; db: pg.Pool; keys: KeyResolver; store: BlobStore; now?: () => Date };
 
@@ -34,6 +35,11 @@ const ISSUE_FROM = `FROM issues i LEFT JOIN orgs ro ON ro.id=i.responsible_org_i
 export const complaintId = (no: number | string | null | undefined) =>
   no == null ? null : `NT-${String(no).padStart(6, '0')}`;
 
+/** Official records for a PUBLIC view: computed from the same rounded point the public sees,
+ *  so nearest-road selection and derived distances can never leak finer private precision. */
+async function publicOfficialRecords(db: pg.Pool, r: any) {
+  return officialRecordsForPoint(db, Math.round(r.lat * 1e4) / 1e4, Math.round(r.lon * 1e4) / 1e4);
+}
 function publicDto(r: any) {
   return {
     id: r.id, complaint_no: r.complaint_no == null ? null : Number(r.complaint_no), complaint_id: complaintId(r.complaint_no == null ? null : Number(r.complaint_no)), hazard: r.hazard, status: r.status, severity: r.severity, ward: r.ward,
@@ -302,13 +308,13 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
     const issue = r.rows[0];
     const staff = isStaffOf(issue, ms, ['admin', 'officer', 'contractor', 'utility']) || isReviewer(issue, ms) || isTriager(issue, ms);
     if (!staff && !(await isReporter(db, id, p.userId))) throw new HttpError(404, 'Issue not found', 'not_found');
-    if (!isStaffOf(issue, ms, ['admin', 'officer', 'contractor', 'utility']) && !isReviewer(issue, ms) && !(await isReporter(db, id, p.userId))) return { ...publicDto(issue), triage_only: true }; // triage view: public-level fields only
+    if (!isStaffOf(issue, ms, ['admin', 'officer', 'contractor', 'utility']) && !isReviewer(issue, ms) && !(await isReporter(db, id, p.userId))) return { ...publicDto(issue), triage_only: true, official_records: await publicOfficialRecords(db, issue) }; // triage view: public-level fields + official records from the public point
     const events = (await db.query('SELECT id, kind, from_status, to_status, reason, actor_id IS NULL AS system, created_at FROM status_events WHERE issue_id=$1 ORDER BY id', [id])).rows;
     const ev = (await db.query('SELECT id, kind, location_ok, created_at FROM evidence WHERE issue_id=$1 ORDER BY created_at', [id])).rows;
     // Dispute ids go only to staff of the issue's orgs (contractor/utility raise, municipal staff decide). Reporters never see them.
     const staffView = isStaffOf(issue, ms, ['admin', 'officer', 'contractor', 'utility']);
     const disputes = staffView ? (await db.query('SELECT id, status, reason, org_id, evidence_id, created_at, decided_at, decision_reason FROM disputes WHERE issue_id=$1 ORDER BY created_at', [id])).rows : undefined;
-    return { ...fullDto(issue), events, evidence: ev, ...(disputes ? { disputes } : {}), redaction: 'none (photos are never public)' };
+    return { ...fullDto(issue), events, evidence: ev, ...(disputes ? { disputes } : {}), official_records: await officialRecordsForPoint(db, issue.lat, issue.lon), redaction: 'none (photos are never public)' };
   });
 
   // ---------- public, no login ----------
@@ -321,7 +327,12 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
     const id = parse(uuid, (req.params as any).id);
     const r = await db.query(`SELECT ${ISSUE_COLS} ${ISSUE_FROM} WHERE i.id=$1`, [id]);
     if (!r.rowCount || r.rows[0].is_test) throw new HttpError(404, 'Issue not found', 'not_found');
-    return publicDto(r.rows[0]);
+    const row = r.rows[0];
+    return { ...publicDto(row), official_records: await publicOfficialRecords(db, row) };
+  });
+  app.get('/v1/public/gov-records/nhai-awards', async (req) => {
+    const q = parse(z.object({ state: z.string().max(60).optional(), nh: z.string().max(20).optional(), limit: z.coerce.number().int().min(1).max(352).default(100) }).strict(), req.query);
+    return nhaiAwardsBrowse(db, q);
   });
   app.get('/v1/public/scorecards', async () => {
     if (!cfg.publicScorecards) throw new HttpError(404, 'Public scorecards are not enabled (legal review pending)', 'not_enabled');
