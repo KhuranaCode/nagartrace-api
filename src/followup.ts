@@ -41,18 +41,19 @@
  * re-reviewed on its own (claim-token or equivalent), and it remains a separate authorized
  * scope. The conditional writes guarantee no state corruption regardless.
  *
- * Verified recipient: Principal.email is set ONLY when the issuer's token carries an explicit
- * verified marker (email_verified === true, top-level or user_metadata). Supabase access
- * tokens document NO email-verification claim (official JWT fields reference,
- * supabase.com/docs/guides/auth/jwt-fields, read 2026-10-30: email + user_metadata only), so
- * with a stock Supabase issuer campaign creation honestly returns signin_email_unavailable.
- * Binding to a server-confirmed address is owner-surface future scope (Supabase project
- * settings / Management API), coordinated via the infra owner - NOT assumed here.
+ * Verified recipient, two trusted paths ONLY (see verified-email.ts):
+ *  (1) an issuer-owned TOP-LEVEL email_verified===true JWT claim (user_metadata is
+ *      user-editable and NEVER accepted); stock Supabase tokens carry no such claim
+ *      (supabase.com/docs/guides/auth/jwt-fields, read 2026-10-30);
+ *  (2) a server-confirmed auth-user record (email_confirmed_at) via the issuer's Admin API,
+ *      bound to the token's (issuer, subject). Anything else is honestly unavailable:
+ *      signin_email_unavailable, never a guess.
  */
 import { createHash } from 'node:crypto';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import type pg from 'pg';
 import { authenticate, HttpError, memberships, type KeyResolver } from './auth.ts';
+import { noAuthUserLookup, type AuthUserLookup } from './verified-email.ts';
 import type { Config } from './config.ts';
 
 const DAY_STAGES = [7, 10, 15, 30] as const;
@@ -230,8 +231,9 @@ export async function sweepFollowups(db: pg.Pool, sender: Sender, maxAttempts = 
   return { sent, states };
 }
 
-export function registerFollowupRoutes(app: FastifyInstance, deps: { cfg: Config; db: pg.Pool; keys: KeyResolver }) {
+export function registerFollowupRoutes(app: FastifyInstance, deps: { cfg: Config; db: pg.Pool; keys: KeyResolver; authUserLookup?: AuthUserLookup }) {
   const { cfg, db, keys } = deps;
+  const lookupAuthUser = deps.authUserLookup ?? noAuthUserLookup;
   const auth = (req: FastifyRequest) => authenticate(req.headers.authorization, cfg, keys, db);
   const hasIssueAccess = async (issueId: string, userId: string) =>
     !!(await db.query(
@@ -297,11 +299,19 @@ export function registerFollowupRoutes(app: FastifyInstance, deps: { cfg: Config
     let recipientVerified = false;
     if (audience === 'reporter') {
       if (recipient_descriptor !== 'self') throw new HttpError(400, 'reporter campaigns are self-addressed', 'bad_audience');
-      if (!p.email) throw new HttpError(400, 'your sign-in address is not available from this session', 'signin_email_unavailable');
-      if (typeof recipient_email !== 'string' || recipient_email.toLowerCase() !== p.email.toLowerCase())
+      // Trusted address, in order: (1) issuer-owned top-level verified JWT claim (auth.ts);
+      // (2) server-confirmed auth-user record (email_confirmed_at) bound to (issuer, subject).
+      // A JWT claim that disagrees with the server record makes the address UNAVAILABLE.
+      let trusted = p.email ?? null;
+      if (!trusted) {
+        const v = await lookupAuthUser(p.subject);
+        if (v.status !== 'verified') throw new HttpError(400, 'your sign-in address is not verified for this session', 'signin_email_unavailable');
+        trusted = v.email;
+      }
+      if (typeof recipient_email !== 'string' || recipient_email.toLowerCase() !== trusted.toLowerCase())
         throw new HttpError(403, 'recipient_email must be your own sign-in address', 'recipient_mismatch');
-      address = p.email;
-      recipientVerified = true; // p.email exists ONLY with an issuer-verified marker (see auth.ts + header)
+      address = trusted;
+      recipientVerified = true; // set ONLY via one of the two trusted paths above
     }
     const descriptor = audience === 'reporter' ? 'self' : String(recipient_descriptor ?? '');
     if (audience === 'authority' && !descriptor) throw new HttpError(400, 'recipient_required', 'recipient_required');

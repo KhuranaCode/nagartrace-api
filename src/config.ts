@@ -30,6 +30,9 @@ export type Config = {
   rateLimitMax: number;
   /** Follow-up reminder pipeline routes + sweep job. Default OFF; the deployment owner flips FOLLOWUP_PIPELINE=true AFTER migration 011 is applied (coordinated). When off, the routes return 404 and clients show the static honest fallback. */
   followupPipeline: boolean;
+  /** Server-to-server only: service-role key for the auth issuer's Admin API (verified-email
+   *  binding). NEVER exposed to the browser, never logged. Absent => binding unavailable. */
+  authServiceRoleKey?: string;
 };
 
 export function defaults(): Omit<Config, 'authIssuer' | 'authAudience' | 'databaseUrl'> {
@@ -56,6 +59,7 @@ export function defaults(): Omit<Config, 'authIssuer' | 'authAudience' | 'databa
     photoRequired: false, // flipped by the deployment owner after the photo-staging client is live
     rateLimitMax: 120,
     followupPipeline: false, // flipped by the deployment owner after migration 011 is applied
+    authServiceRoleKey: undefined,
   };
 }
 
@@ -100,5 +104,6 @@ export function fromEnv(env = process.env): Config {
     publicScorecards: env.PUBLIC_SCORECARDS === 'true',
     photoRequired: env.PHOTO_REQUIRED === 'true',
     followupPipeline: env.FOLLOWUP_PIPELINE === 'true',
+    authServiceRoleKey: env.SUPABASE_SERVICE_ROLE_KEY || undefined,
   } as Config;
 }

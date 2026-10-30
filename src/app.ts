@@ -7,10 +7,13 @@ import { authenticate, HttpError, memberships, type KeyResolver, type Membership
 import { awardPoints, deadlineHours, lockIssue, recordEvent, routeIssue, runEscalations, severityOf, transition } from './domain.ts';
 import { registerStreakRoutes } from './streaks.ts';
 import { registerFollowupRoutes } from './followup.ts';
+import { supabaseAuthUserLookup } from './verified-email.ts';
 import { normalizeImage } from './images.ts';
 import type { BlobStore } from './storage.ts';
 
-export type Deps = { cfg: Config; db: pg.Pool; keys: KeyResolver; store: BlobStore; now?: () => Date };
+export type Deps = { cfg: Config; db: pg.Pool; keys: KeyResolver; store: BlobStore; now?: () => Date;
+  /** Override for the verified-email binding (tests); defaults to the Supabase Admin API lookup. */
+  authUserLookup?: import('./verified-email.ts').AuthUserLookup };
 
 const HAZARDS = ['pothole', 'crack', 'waterlogging', 'broken_edge', 'missing_cover', 'other'] as const;
 const uuid = z.string().uuid();
@@ -721,7 +724,7 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
   registerStreakRoutes(app, { cfg, db, keys });
   // Follow-up reminder pipeline: mounted only when the deployment owner enables it
   // (FOLLOWUP_PIPELINE=true) after migration 011 is applied. Off => 404 => honest client fallback.
-  if (cfg.followupPipeline) registerFollowupRoutes(app, { cfg, db, keys });
+  if (cfg.followupPipeline) registerFollowupRoutes(app, { cfg, db, keys, authUserLookup: deps.authUserLookup ?? supabaseAuthUserLookup(cfg) });
 
   return app;
 }
