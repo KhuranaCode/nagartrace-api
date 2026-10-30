@@ -31,9 +31,9 @@ export async function authenticate(header: string | undefined, cfg: Config, keys
   return { userId: u.id, issuer: iss, subject: sub, suspended: false, ageHours: Number(u.age_h) };
 }
 
-export type Membership = { org_id: string; role: 'admin' | 'officer' | 'contractor' | 'utility'; kind: string };
+export type Membership = { org_id: string; role: 'admin' | 'officer' | 'contractor' | 'utility'; kind: string; synthetic: boolean };
 
 export async function memberships(db: pg.Pool | pg.PoolClient, userId: string): Promise<Membership[]> {
-  const r = await db.query(`SELECT m.org_id, m.role, o.kind FROM memberships m JOIN orgs o ON o.id=m.org_id WHERE m.user_id=$1 AND m.revoked_at IS NULL`, [userId]);
+  const r = await db.query(`SELECT m.org_id, m.role, o.kind, o.is_synthetic AS synthetic FROM memberships m JOIN orgs o ON o.id=m.org_id WHERE m.user_id=$1 AND m.revoked_at IS NULL`, [userId]);
   return r.rows;
 }

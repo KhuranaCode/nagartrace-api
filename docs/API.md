@@ -10,6 +10,7 @@ Rate limits apply. Where a record is hidden from you the API returns 404, not 40
 - `GET /public/scorecards` -> 404 until enabled (legal review pending)
 PublicIssue: `id, hazard, status, severity, ward, location{lat,lon (rounded ~11 m)}, responsible{kind,name,synthetic_data}|null, deadline_at, reports_count, route_flags[], created_at, updated_at`. No reporter, no photos.
 Show a "Synthetic data" badge when `responsible.synthetic_data` is true. `route_flags` may contain `road_not_in_registry`, `needs_manual_routing`.
+Authenticated issue DTO (`/issues`, `/issues/:id`) = PublicIssue plus detail fields and `test_data: boolean`. The public DTO never carries `test_data` (public endpoints list genuine data only). `GET /me` returns the caller's own `is_test` and memberships `{org_id, kind, role, synthetic, ...}`. See `docs/DATA_SEPARATION.md`.
 
 ## Me
 - `GET /me` -> `{id, alias, ward, points, memberships:[{org_id, role, kind}]}` (the first call creates the account as a plain citizen)

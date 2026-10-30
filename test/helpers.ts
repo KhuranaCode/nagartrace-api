@@ -76,7 +76,7 @@ export async function seed(w: World) {
   const admin = await mk('admin-1');
   await w.adminDb.query(`INSERT INTO memberships (user_id, org_id, role) VALUES ($1,$2,'admin')`, [admin.id, muni]);
   const imp = await admin.c.post('/v1/admin/registry/import', {
-    municipality_org_id: muni, source_label: 'Synthetic test registry', is_synthetic: true,
+    municipality_org_id: muni, source_label: 'Synthetic test registry', is_synthetic: false,
     roads: [R_WARRANTY, R_UTILITY, R_EXPIRED],
     contracts: [
       { road_code: 'R-WARR', contractor_name: 'Sharma Infra', completion_date: '2024-01-01', warranty_end: '2099-01-01' },

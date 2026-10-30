@@ -47,15 +47,15 @@ export type Route = { orgId: string | null; kind: 'municipality' | 'contractor' 
 
 /** PRD routing, first match wins: (1) road not in registry -> municipality + flag; (2) recent utility cut -> utility, copy municipality;
  *  (3) inside warranty -> contractor, copy municipality; else municipality. Never invents a contractor. */
-export async function routeIssue(c: Q, cfg: Config, lat: number, lon: number, now = new Date()): Promise<Route> {
+export async function routeIssue(c: Q, cfg: Config, lat: number, lon: number, now = new Date(), test = false): Promise<Route> {
   const road = await c.query(
     `SELECT id, municipality_org_id, ward FROM road_segments
-     WHERE ST_DWithin(geom, ST_SetSRID(ST_MakePoint($2,$1),4326)::geography, $3)
-     ORDER BY ST_Distance(geom, ST_SetSRID(ST_MakePoint($2,$1),4326)::geography) LIMIT 1`, [lat, lon, cfg.roadMatchRadiusM]);
+     WHERE is_synthetic=$4 AND ST_DWithin(geom, ST_SetSRID(ST_MakePoint($2,$1),4326)::geography, $3)
+     ORDER BY ST_Distance(geom, ST_SetSRID(ST_MakePoint($2,$1),4326)::geography) LIMIT 1`, [lat, lon, cfg.roadMatchRadiusM, test]);
   if (!road.rowCount) {
-    const m = await c.query(`SELECT id FROM orgs WHERE kind='municipality'`);
+    const m = await c.query(`SELECT id FROM orgs WHERE kind='municipality' AND is_synthetic=$1`, [test]);
     if (m.rowCount === 1) return { orgId: m.rows[0].id, kind: 'municipality', copyOrgId: null, roadId: null, reason: 'Road not found in registry; sent to municipality for review', flags: ['road_not_in_registry'], ward: null, reviewOrgId: m.rows[0].id };
-    return { orgId: null, kind: null, copyOrgId: null, roadId: null, reason: 'Road not in registry and no single municipality to route to', flags: ['road_not_in_registry', 'needs_manual_routing'], ward: null, reviewOrgId: null };
+    return { orgId: null, kind: null, copyOrgId: null, roadId: null, reason: test ? 'Road not in registry and no single municipality to route to' : 'No real authority is connected yet; report is stored unassigned', flags: ['road_not_in_registry', 'needs_manual_routing'], ward: null, reviewOrgId: null };
   }
   const { id: roadId, municipality_org_id: muni, ward } = road.rows[0];
   const day = now.toISOString().slice(0, 10);

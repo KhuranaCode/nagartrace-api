@@ -24,7 +24,7 @@ function parse<T>(schema: z.ZodType<T>, v: unknown): T {
 const ISSUE_COLS = `i.review_org_id, i.id, i.hazard, i.danger_flag, i.severity, i.status, i.ward, i.responsible_kind, i.route_reason, i.route_flags, i.route_overridden,
   i.deadline_at, i.reports_count, i.reopen_count, i.created_at, i.updated_at, i.fixed_at,
   ST_Y(i.geom::geometry) AS lat, ST_X(i.geom::geometry) AS lon,
-  ro.id AS responsible_org_id, ro.name AS responsible_org_name, ro.is_synthetic AS responsible_synthetic, co.name AS copy_org_name, i.copy_org_id`;
+  i.is_test, ro.id AS responsible_org_id, ro.name AS responsible_org_name, ro.is_synthetic AS responsible_synthetic, co.name AS copy_org_name, i.copy_org_id`;
 const ISSUE_FROM = `FROM issues i LEFT JOIN orgs ro ON ro.id=i.responsible_org_id LEFT JOIN orgs co ON co.id=i.copy_org_id`;
 
 /** Public view: no reporter identity, no evidence, coordinates rounded to ~11 m. */
@@ -37,7 +37,7 @@ function publicDto(r: any) {
   };
 }
 function fullDto(r: any) {
-  return { ...publicDto(r), location: { lat: r.lat, lon: r.lon }, danger_flag: r.danger_flag, route_reason: r.route_reason, route_overridden: r.route_overridden,
+  return { ...publicDto(r), test_data: !!r.is_test, location: { lat: r.lat, lon: r.lon }, danger_flag: r.danger_flag, route_reason: r.route_reason, route_overridden: r.route_overridden,
     reopen_count: r.reopen_count, fixed_at: r.fixed_at, copy_org: r.copy_org_name ?? null,
     responsible_org_id: r.responsible_org_id ?? null, copy_org_id: r.copy_org_id ?? null, review_org_id: r.review_org_id ?? null };
 }
@@ -83,7 +83,7 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
   const isMunicipalStaff = (issue: any, ms: Membership[]) => ms.some((m) => (m.role === 'officer' || m.role === 'admin') && m.kind === 'municipality' && (m.org_id === issue.responsible_org_id || m.org_id === issue.copy_org_id));
   const isReviewer = (issue: any, ms: Membership[]) => issue.status === 'reported' && !!issue.review_org_id && ms.some((m) => (m.role === 'officer' || m.role === 'admin') && m.kind === 'municipality' && m.org_id === issue.review_org_id);
   // Unrouted pending report (no municipality could be chosen): any municipal officer/admin may see it (no photos) and claim it for review. Who should own such reports is an OPEN policy decision.
-  const isTriager = (issue: any, ms: Membership[]) => cfg.unroutedTriage === 'any_municipal_staff' && issue.status === 'reported' && !issue.review_org_id && ms.some((m) => (m.role === 'officer' || m.role === 'admin') && m.kind === 'municipality');
+  const isTriager = (issue: any, ms: Membership[]) => cfg.unroutedTriage === 'any_municipal_staff' && issue.status === 'reported' && !issue.review_org_id && ms.some((m) => (m.role === 'officer' || m.role === 'admin') && m.kind === 'municipality' && m.synthetic === !!issue.is_test); // cohort guard: fixture staff only triage fixture reports, real staff only real ones
   const isAssignee = (issue: any, ms: Membership[]) => ms.some((m) => m.org_id === issue.responsible_org_id && ['contractor', 'utility', 'officer', 'admin'].includes(m.role));
   const isReporter = async (c: pg.Pool | pg.PoolClient, issueId: string, userId: string) => !!(await c.query('SELECT 1 FROM reports WHERE issue_id=$1 AND user_id=$2', [issueId, userId])).rowCount;
 
@@ -92,7 +92,7 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
   // ---------- identity ----------
   app.get('/v1/me', async (req) => {
     const p = await auth(req);
-    const u = (await db.query('SELECT id, alias, ward, points, created_at FROM users WHERE id=$1', [p.userId])).rows[0];
+    const u = (await db.query('SELECT id, alias, ward, points, created_at, is_test FROM users WHERE id=$1', [p.userId])).rows[0];
     const ms = await memberships(db, p.userId);
     return { ...u, memberships: ms };
   });
@@ -139,13 +139,14 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
         const ex = await c.query('SELECT issue_id, id FROM reports WHERE user_id=$1 AND idempotency_key=$2', [p.userId, idem]);
         if (ex.rowCount) return { issueId: ex.rows[0].issue_id, reportId: ex.rows[0].id, created: false, merged: false, replay: true };
       }
+      const isTest = !!(await c.query('SELECT is_test FROM users WHERE id=$1', [p.userId])).rows[0]?.is_test;
       const cap = await c.query(`SELECT count(*)::int AS n FROM reports WHERE user_id=$1 AND created_at > now() - interval '24 hours'`, [p.userId]);
       if (cap.rows[0].n >= cfg.dailyReportCap) throw new HttpError(429, 'Daily report limit reached', 'daily_cap');
 
       const dup = await c.query(
-        `SELECT id FROM issues WHERE hazard=$1 AND status NOT IN ('fixed','rejected')
+        `SELECT id FROM issues WHERE hazard=$1 AND status NOT IN ('fixed','rejected') AND is_test=$5
          AND ST_DWithin(geom, ST_SetSRID(ST_MakePoint($3,$2),4326)::geography, $4)
-         ORDER BY ST_Distance(geom, ST_SetSRID(ST_MakePoint($3,$2),4326)::geography) LIMIT 1 FOR UPDATE`, [b.hazard, b.lat, b.lon, cfg.duplicateRadiusM]);
+         ORDER BY ST_Distance(geom, ST_SetSRID(ST_MakePoint($3,$2),4326)::geography) LIMIT 1 FOR UPDATE`, [b.hazard, b.lat, b.lon, cfg.duplicateRadiusM, isTest]);
       let issueId: string; let created = false; let merged = false;
       if (dup.rowCount) {
         issueId = dup.rows[0].id;
@@ -163,10 +164,10 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
         merged = true;
       } else {
         const sev = severityOf(b.hazard, b.danger, 1);
-        const route = await routeIssue(c, cfg, b.lat, b.lon, t);
+        const route = await routeIssue(c, cfg, b.lat, b.lon, t, isTest);
         const ins = await c.query(
-          `INSERT INTO issues (reporter_id, geom, hazard, danger_flag, severity, ward, road_id) VALUES ($1, ST_SetSRID(ST_MakePoint($3,$2),4326)::geography, $4,$5,$6,$7,$8) RETURNING id`,
-          [p.userId, b.lat, b.lon, b.hazard, b.danger, sev, route.ward, route.roadId]);
+          `INSERT INTO issues (reporter_id, geom, hazard, danger_flag, severity, ward, road_id, is_test) VALUES ($1, ST_SetSRID(ST_MakePoint($3,$2),4326)::geography, $4,$5,$6,$7,$8,$9) RETURNING id`,
+          [p.userId, b.lat, b.lon, b.hazard, b.danger, sev, route.ward, route.roadId, isTest]);
         issueId = ins.rows[0].id; created = true;
         await recordEvent(c, issueId, p.userId, null, 'reported', 'created');
         if (cfg.verificationMode === 'auto_checks' && route.orgId) {
@@ -205,7 +206,7 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
     const mine = orgIds(ms);
     const r = await db.query(
       `SELECT ${ISSUE_COLS} ${ISSUE_FROM}
-       WHERE (EXISTS (SELECT 1 FROM reports rp WHERE rp.issue_id=i.id AND rp.user_id=$1) OR i.responsible_org_id = ANY($2::uuid[]) OR i.copy_org_id = ANY($2::uuid[]) OR (i.status='reported' AND (i.review_org_id = ANY($6::uuid[]) OR (i.review_org_id IS NULL AND cardinality($6::uuid[]) > 0 AND $7::boolean))))
+       WHERE (EXISTS (SELECT 1 FROM reports rp WHERE rp.issue_id=i.id AND rp.user_id=$1) OR i.responsible_org_id = ANY($2::uuid[]) OR i.copy_org_id = ANY($2::uuid[]) OR (i.status='reported' AND (i.review_org_id = ANY($6::uuid[]) OR (i.review_org_id IS NULL AND $7::boolean AND EXISTS (SELECT 1 FROM orgs tz WHERE tz.id = ANY($6::uuid[]) AND tz.is_synthetic = i.is_test)))))
        AND ($3::text IS NULL OR i.status::text=$3) AND ($5::text IS NULL OR i.responsible_kind::text=$5) ORDER BY i.created_at DESC LIMIT $4`, [p.userId, mine, q.status ?? null, q.limit, q.responsible ?? null, orgIds(ms.filter((m) => m.kind === 'municipality' && ['officer', 'admin'].includes(m.role))), cfg.unroutedTriage === 'any_municipal_staff']);
     // Unrouted reports seen only through triage get the public (rounded, no reporter) view.
     const rep = new Set((await db.query('SELECT DISTINCT issue_id FROM reports WHERE user_id=$1', [p.userId])).rows.map((x) => x.issue_id));
@@ -232,25 +233,25 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
   // ---------- public, no login ----------
   app.get('/v1/public/issues', async (req) => {
     const q = parse(z.object({ responsible: z.enum(['municipality','contractor','utility']).optional(), status: z.string().optional(), ward: z.string().max(60).optional(), limit: z.coerce.number().int().min(1).max(200).default(100) }), req.query);
-    const r = await db.query(`SELECT ${ISSUE_COLS} ${ISSUE_FROM} WHERE ($1::text IS NULL OR i.status::text=$1) AND ($2::text IS NULL OR i.ward=$2) AND ($4::text IS NULL OR i.responsible_kind::text=$4) ORDER BY i.created_at DESC LIMIT $3`, [q.status ?? null, q.ward ?? null, q.limit, q.responsible ?? null]);
+    const r = await db.query(`SELECT ${ISSUE_COLS} ${ISSUE_FROM} WHERE NOT i.is_test AND ($1::text IS NULL OR i.status::text=$1) AND ($2::text IS NULL OR i.ward=$2) AND ($4::text IS NULL OR i.responsible_kind::text=$4) ORDER BY i.created_at DESC LIMIT $3`, [q.status ?? null, q.ward ?? null, q.limit, q.responsible ?? null]);
     return { issues: r.rows.map(publicDto) };
   });
   app.get('/v1/public/issues/:id', async (req) => {
     const id = parse(uuid, (req.params as any).id);
     const r = await db.query(`SELECT ${ISSUE_COLS} ${ISSUE_FROM} WHERE i.id=$1`, [id]);
-    if (!r.rowCount) throw new HttpError(404, 'Issue not found', 'not_found');
+    if (!r.rowCount || r.rows[0].is_test) throw new HttpError(404, 'Issue not found', 'not_found');
     return publicDto(r.rows[0]);
   });
   app.get('/v1/public/scorecards', async () => {
     if (!cfg.publicScorecards) throw new HttpError(404, 'Public scorecards are not enabled (legal review pending)', 'not_enabled');
-    return { scorecards: await scorecards(db) };
+    return { scorecards: await scorecards(db, false) };
   });
   app.get('/v1/leaderboard', async (req) => {
-    await auth(req);
+    const pr = await auth(req);
     const q = parse(z.object({ ward: z.string().max(60).optional(), period: z.enum(['weekly', 'all']).default('all') }), req.query);
     const r = await db.query(
       `SELECT u.alias, u.ward, COALESCE(SUM(l.delta),0)::int AS points FROM users u JOIN points_ledger l ON l.user_id=u.id
-       WHERE ($1::text IS NULL OR u.ward=$1) AND ($2='all' OR l.created_at > now() - interval '7 days') GROUP BY u.id ORDER BY points DESC LIMIT 50`, [q.ward ?? null, q.period]);
+       WHERE ($1::text IS NULL OR u.ward=$1) AND ($2='all' OR l.created_at > now() - interval '7 days') AND u.is_test = (SELECT is_test FROM users WHERE id=$3) GROUP BY u.id ORDER BY points DESC LIMIT 50`, [q.ward ?? null, q.period, pr.userId]);
     return { leaderboard: r.rows };
   });
 
@@ -298,6 +299,7 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
       const target = b.org_id ?? (mine.length === 1 ? mine[0] : null);
       if (!target) throw new HttpError(422, 'org_id required when you belong to several municipalities', 'validation');
       if (!mine.includes(target)) throw new HttpError(403, 'Not staff of that municipality', 'forbidden');
+      if (!ms.some((m) => m.org_id === target && m.synthetic === !!issue.is_test)) throw new HttpError(404, 'Issue not found', 'not_found');
       // Claiming only makes this municipality the reviewer. It assigns nothing; an officer must still verify.
       await c.query(`UPDATE issues SET review_org_id=$2, suggested_org_id=$2, suggested_kind='municipality', suggested_reason=$3, updated_at=now() WHERE id=$1`, [id, target, `Claimed for review: ${b.reason}`]);
       await recordEvent(c, id, p.userId, 'reported', 'reported', 'review_claimed', b.reason, { org_id: target });
@@ -558,7 +560,7 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
     const p = await auth(req);
     const ms = await memberships(db, p.userId);
     if (!ms.some((m) => (m.role === 'admin' || m.role === 'officer') && m.kind === 'municipality')) throw new HttpError(403, 'Municipal staff only', 'forbidden');
-    return { scorecards: await scorecards(db), note: 'Counts only issues with no open dispute (PRD). Not public until legal review.' };
+    return { scorecards: await scorecards(db, !!(await db.query('SELECT is_test FROM users WHERE id=$1', [p.userId])).rows[0]?.is_test), note: 'Counts only issues with no open dispute (PRD). Not public until legal review.' };
   });
 
   return app;
@@ -570,14 +572,14 @@ async function reopen(c: pg.PoolClient, cfg: Config, issue: any, actor: string |
   return 'reopened';
 }
 
-async function scorecards(db: pg.Pool) {
+async function scorecards(db: pg.Pool, test: boolean) {
   const r = await db.query(
     `SELECT o.id AS org_id, o.name, o.is_synthetic,
        count(*) FILTER (WHERE i.status='fixed')::int AS fixed, count(*)::int AS total,
        COALESCE(avg(EXTRACT(EPOCH FROM (i.fixed_at - i.created_at))/3600) FILTER (WHERE i.status='fixed'),0)::float AS avg_fix_hours,
        count(*) FILTER (WHERE i.reopen_count>0)::int AS reopened
      FROM orgs o JOIN issues i ON i.responsible_org_id=o.id AND i.responsible_kind='contractor'
-     WHERE NOT EXISTS (SELECT 1 FROM disputes d WHERE d.issue_id=i.id AND d.status='open') GROUP BY o.id`);
+     WHERE i.is_test=$1 AND NOT EXISTS (SELECT 1 FROM disputes d WHERE d.issue_id=i.id AND d.status='open') GROUP BY o.id`, [test]);
   return r.rows.map((x) => ({ org_id: x.org_id, name: x.name, synthetic_data: x.is_synthetic, issues: x.total, fix_rate: x.total ? x.fixed / x.total : 0, avg_fix_hours: x.avg_fix_hours, reopen_rate: x.total ? x.reopened / x.total : 0 }));
 }
 
