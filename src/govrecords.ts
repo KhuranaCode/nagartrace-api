@@ -21,11 +21,15 @@ import { HttpError } from './auth.js';
 const NEAREST_ROAD_RADIUS_M = 200; // engineering threshold for point-to-road lookup
 
 /** Extract normalized NH number tokens from an OSM ref ('NH-44', 'NH44;NH-48', '44' -> ['44','48']). */
+/** Whole-reference NH tokenizer. A ref component counts as a national highway ONLY when it
+ *  carries an explicit NH prefix ('NH-44', 'NH 44', 'NH44', optional suffix letters like 544E).
+ *  Bare digits are NOT accepted: a number alone is ambiguous (could be SH/MDR/local) and road
+ *  class is never inferred from digits. SH/SR/MDR refs therefore never match NH award rows. */
 export function nhTokens(ref: string | null | undefined): string[] {
   if (!ref) return [];
   const out = new Set<string>();
-  for (const part of ref.split(/[;,/\s]+/)) {
-    const m = /^NH-?(\d{1,3}[A-Z]{0,2})$/i.exec(part.trim()) ?? /^(\d{1,3})$/.exec(part.trim());
+  for (const part of ref.split(/[;,/|]+/)) {
+    const m = /^\s*NH[-\s]?(\d{1,3}[A-Za-z]{0,2})\s*$/i.exec(part);
     if (m) out.add(m[1].toUpperCase());
   }
   return [...out];
@@ -86,12 +90,12 @@ export async function officialRecordsForPoint(db: pg.Pool | pg.PoolClient, lat: 
 }
 
 export async function nhaiAwardsBrowse(db: pg.Pool | pg.PoolClient, q: { state?: string; nh?: string; limit: number }) {
+  let nh: string[] | null = null;
   if (q.nh !== undefined) {
     const raw = q.nh.trim().replace(/^nh[-\s]?/i, '');
-    if (!/^\d+[A-Za-z]{0,2}$/.test(raw)) throw new HttpError(400, 'Invalid nh filter: expected a national-highway number like 44', 'validation');
-    if (!nhTokens(q.nh).length) throw new HttpError(400, 'Invalid nh filter: expected a national-highway number like 44', 'validation');
+    if (!/^\d{1,3}[A-Za-z]{0,2}$/.test(raw)) throw new HttpError(400, 'Invalid nh filter: expected a national-highway number like 44', 'validation');
+    nh = [raw.toUpperCase()]; // the filter is named 'nh', so bare '44' unambiguously means NH-44 here
   }
-  const nh = q.nh ? nhTokens(q.nh) : null;
   const r = await db.query(
     `SELECT sr, project_name, state, length_km, loa_date, awarded_cost_cr, piu, mode,
             contractor_name, project_stage, project_type, chainage_km_marks, nh_from_name, page, source_url, source_label

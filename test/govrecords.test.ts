@@ -3,16 +3,23 @@ import assert from 'node:assert/strict';
 import { newWorld, seed, client, sign, reportBody } from './helpers.ts';
 import { nhTokens, officialRecordsForPoint } from '../src/govrecords.ts';
 
-test('nhTokens: strict NH token extraction, no fuzzy matches', () => {
+test('nhTokens: strict whole-reference NH validation, no fuzzy/digit-only matches', () => {
   assert.deepEqual(nhTokens('NH-44'), ['44']);
   assert.deepEqual(nhTokens('NH44'), ['44']);
   assert.deepEqual(nhTokens('NH 44'), ['44']);
-  assert.deepEqual(nhTokens('44'), ['44']);
   assert.deepEqual(nhTokens('NH-44;NH-48'), ['44', '48']);
   assert.deepEqual(nhTokens('NH-161A'), ['161A']);
   assert.deepEqual(nhTokens(null), []);
   assert.deepEqual(nhTokens('Grand Trunk Road'), []);
   assert.deepEqual(nhTokens('NH'), []);
+  // a bare number is ambiguous (could be SH/MDR/local): never inferred as NH from digits alone
+  assert.deepEqual(nhTokens('44'), []);
+  // state/other highway schemes must never match NH award rows
+  assert.deepEqual(nhTokens('SH 44'), []);
+  assert.deepEqual(nhTokens('SH-44'), []);
+  assert.deepEqual(nhTokens('SR44'), []);
+  assert.deepEqual(nhTokens('MDR 44'), []);
+  assert.deepEqual(nhTokens('State Highway 44'), []);
 });
 
 const insertRoad2 = (w: any, o: { name?: string | null; ref?: string | null; lat?: number; lon?: number }) =>
@@ -71,6 +78,27 @@ test('official records: honest absences - no road, non-NH road, NH with no FY aw
     assert.equal(r.road?.ref, 'NH-99');
     assert.equal(r.candidate_awards.length, 0);
     assert.match(r.coverage_note, /FY2024-25 only/);
+  } finally { await w.close(); }
+});
+
+test('nearest staged road with SH/SR/bare-digit ref yields NO NH candidates', async () => {
+  const w = await newWorld();
+  try {
+    await seed(w);
+    for (const ref of ['SH 44', 'SR-44', '44', 'MDR 44', 'State Highway 44']) {
+      await insertRoad2(w, { name: 'SH Strip ' + ref, ref, lat: 30.71, lon: 76.71 });
+      await insertAward(w, { sr: 950 + ref.length, nh: ['44'], contractor: 'Real Builder Nine' });
+      const r = await officialRecordsForPoint(w.adminDb, 30.7105, 76.7105);
+      assert.equal(r.road?.ref, ref);
+      assert.equal(r.candidate_awards.length, 0, `ref ${ref} must never join NH-44 awards`);
+      assert.match(r.coverage_note, /no national-highway reference|No FY2024-25 NHAI award record is linked/);
+      await w.adminDb.query('DELETE FROM road_registry_staging'); await w.adminDb.query('DELETE FROM nhai_award_records');
+    }
+    // explicit NH prefix on the road ref still joins intentionally
+    await insertRoad2(w, { name: 'Real NH Strip', ref: 'NH 44', lat: 30.71, lon: 76.71 });
+    await insertAward(w, { sr: 949, nh: ['44'], contractor: 'Real Builder Nine' });
+    const ok = await officialRecordsForPoint(w.adminDb, 30.7105, 76.7105);
+    assert.equal(ok.candidate_awards.length, 1);
   } finally { await w.close(); }
 });
 
