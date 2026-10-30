@@ -192,13 +192,26 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
       // Serialises issue creation so concurrent reports at one spot merge instead of creating twins. Fine for now; revisit (spatial cell locks) at scale.
       await c.query('SELECT pg_advisory_xact_lock(4201)');
       if (idem) {
-        const ex = await c.query(`SELECT issue_id, id, ST_X(geom::geometry) AS lon, ST_Y(geom::geometry) AS lat FROM reports WHERE user_id=$1 AND idempotency_key=$2`, [p.userId, idem]);
+        const ex = await c.query(
+          `SELECT r.issue_id, r.id, ST_Y(r.geom::geometry) AS lat, ST_X(r.geom::geometry) AS lon, i.hazard
+           FROM reports r JOIN issues i ON i.id = r.issue_id
+           WHERE r.user_id=$1 AND r.idempotency_key=$2`, [p.userId, idem]);
         if (ex.rowCount) {
-          // Replay: still bind a staged photo if the client sent one (the original attempt
-          // may have crashed between issue creation and evidence binding). The location
-          // check uses the ORIGINAL report's stored coordinates, not the retry's.
-          const photo = b.photo_upload_id ? await bindStagedPhoto(c, p.userId, ex.rows[0].issue_id, b.photo_upload_id, ex.rows[0].lon, ex.rows[0].lat) : null;
-          return { issueId: ex.rows[0].issue_id, reportId: ex.rows[0].id, created: false, merged: false, replay: true, photo };
+          // Replay = return the ORIGINAL result. It must NEVER consume a new upload:
+          // under the atomic design there is no crash window between report creation
+          // and photo binding (one transaction), so a replay carrying a DIFFERENT
+          // upload id is a changed payload with a reused key, not a recovery - 409.
+          const orig = ex.rows[0];
+          if (orig.lat !== b.lat || orig.lon !== b.lon || orig.hazard !== b.hazard)
+            throw new HttpError(409, 'This idempotency key was already used with a different report', 'idempotency_mismatch');
+          const bound = (await c.query(
+            `SELECT s.id AS upload_id, e.id AS evidence_id FROM staged_uploads s
+             JOIN evidence e ON e.issue_id = s.issue_id AND e.storage_key = s.storage_key
+             WHERE s.issue_id=$1 AND s.uploader_id=$2 AND s.consumed_at IS NOT NULL LIMIT 1`, [orig.issue_id, p.userId])).rows[0];
+          if (b.photo_upload_id && b.photo_upload_id !== bound?.upload_id)
+            throw new HttpError(409, 'This idempotency key was already used with a different photo upload', 'idempotency_mismatch');
+          const photo = bound ? { evidence_id: bound.evidence_id as string, location_ok: true } : null;
+          return { issueId: orig.issue_id, reportId: orig.id, created: false, merged: false, replay: true, photo };
         }
       }
       const isTest = !!(await c.query('SELECT is_test FROM users WHERE id=$1', [p.userId])).rows[0]?.is_test;

@@ -202,6 +202,39 @@ test('photo-mandatory reports: stage + atomic bind, guards and failure modes', a
       assert.ok(r2.json.photo?.evidence_id);
     });
 
+    await t.test('replay with a DIFFERENT upload under a reused idempotency key is 409 and consumes nothing', async () => {
+      const u = await fresh(wOn);
+      const spot = { lat: P_NOROAD.lat + 0.16, lon: P_NOROAD.lon };
+      const up1 = await stageFor(u, spot);
+      const hdr = { 'idempotency-key': `changed-upload-${crypto.randomUUID()}` };
+      const r1 = await u.post('/v1/reports', reportBody(spot, { photo_upload_id: up1 }), hdr);
+      assert.equal(r1.status, 201);
+      const up2 = await stageFor(u, spot);
+      const r2 = await u.post('/v1/reports', reportBody(spot, { photo_upload_id: up2 }), hdr);
+      assert.equal(r2.status, 409);
+      assert.equal(r2.json.error, 'idempotency_mismatch');
+      const det = await u.get(`/v1/issues/${r1.json.issue.id}`);
+      assert.equal(det.json.evidence.length, 1); // the second upload was NOT bound
+      const su = (await wOn.adminDb.query('SELECT consumed_at FROM staged_uploads WHERE id=$1', [up2])).rows[0];
+      assert.equal(su.consumed_at, null); // ... nor consumed
+      // same key + changed coordinates is also a mismatch
+      const r3 = await u.post('/v1/reports', reportBody({ lat: spot.lat + 0.001, lon: spot.lon }, { photo_upload_id: up1 }), hdr);
+      assert.equal(r3.status, 409);
+      assert.equal(r3.json.error, 'idempotency_mismatch');
+      // same key + SAME upload still replays cleanly
+      const r4 = await u.post('/v1/reports', reportBody(spot, { photo_upload_id: up1 }), hdr);
+      assert.equal(r4.status, 200);
+      assert.equal(r4.json.photo?.evidence_id, r1.json.photo?.evidence_id);
+    });
+
+    await t.test('oversize bodies: 8 MB + 1 byte is 413, framework caps at 10 MB', async () => {
+      const u = await fresh(wOn);
+      for (const n of [8 * 1024 * 1024 + 1, 9 * 1024 * 1024, 12 * 1024 * 1024]) {
+        const r = await u.upload(`/v1/uploads/stage?lat=${P_NOROAD.lat}&lon=${P_NOROAD.lon}`, Buffer.alloc(n));
+        assert.equal(r.status, 413, `size ${n}`);
+      }
+    });
+
     await t.test('sweep removes expired unconsumed rows but never consumed evidence blobs', async () => {
       const u = await fresh(wOn);
       const spot = { lat: P_NOROAD.lat + 0.11, lon: P_NOROAD.lon };
