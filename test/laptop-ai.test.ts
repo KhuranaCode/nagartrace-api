@@ -379,3 +379,41 @@ test('consented mode: per-feature consent required, grant unlocks ONLY that feat
     assert.deepEqual(evs, ['granted', 'revoked']);
   } finally { await w.close(); }
 });
+
+test('revoke mid-flight: dispatched request completes honestly; every NEW dispatch denied after revoke, gateway never sees it', async () => {
+  const realFetch = globalThis.fetch;
+  const received: any[] = [];
+  let release!: () => void;
+  const hold = new Promise<void>((r) => { release = r; });
+  globalThis.fetch = (async (url: any, init: any) => {
+    received.push({ url: String(url), body: JSON.parse(init.body) });
+    await hold; // gateway holds the in-flight response until the test releases it
+    return new Response(JSON.stringify({ message: { content: '{"reply":"stub answer"}' } }), { status: 200 });
+  }) as any;
+  try {
+    const w = await newWorld({ aiAccessMode: 'consented', laptopAiUrl: 'https://gw.example', laptopAiToken: 't', laptopAiModel: 'qwen3.5:2b' });
+    try {
+      const u = client(w, await userToken('race-u'));
+      assert.equal((await u.post('/v1/ai/consents', { feature: 'guide_chat', notice_version: 'v1' })).status, 200);
+      const inflight = u.post('/v1/ai/chat', { message: 'how do I report?' });
+      for (let i = 0; i < 200 && received.length === 0; i++) await new Promise((r) => setTimeout(r, 5)); // wait for dispatch
+      assert.equal(received.length, 1, 'dispatch did not reach the gateway');
+      // Payload hygiene at the wire: only the listed input travels - no IDs, no records.
+      const pl = received[0].body;
+      assert.deepEqual(Object.keys(pl).sort(), ['format', 'messages', 'model', 'stream', 'think']);
+      assert.equal(pl.messages.length, 2); // system + user, nothing else
+      assert.deepEqual(JSON.parse(pl.messages[1].content), { message: 'how do I report?', context: null });
+      // Revoke WHILE the forward is in flight:
+      assert.equal((await u.post('/v1/ai/consents/revoke', { feature: 'guide_chat' })).status, 200);
+      release(); // the already-dispatched request cannot be recalled: it completes honestly
+      const done = await inflight;
+      assert.equal(done.status, 200);
+      assert.equal(done.json.reply, 'stub answer');
+      // Every NEW dispatch after revoke is denied and never reaches the gateway:
+      const next = await u.post('/v1/ai/chat', { message: 'again' });
+      assert.equal(next.status, 403);
+      assert.equal(next.json.reason, 'consent_required');
+      assert.equal(received.length, 1, 'gateway saw a request made after revoke');
+    } finally { await w.close(); }
+  } finally { globalThis.fetch = realFetch; }
+});

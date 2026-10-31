@@ -245,6 +245,7 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
     const budget = admitReportCheck(principal.userId);
     if (!budget.ok) return reply.code(503).send({ ai_available: false, reason: budget.reason });
     try {
+      if (await aiDispatchDeny(reply, principal, 'photo_advisory')) return; // re-check just before dispatch
       const advisory = await reportCheck({ url: cfg.laptopAiUrl, token: cfg.laptopAiToken, model: cfg.laptopAiModel, timeoutMs: cfg.laptopAiTimeoutMs },
         { hazard: b.hazard!, note: b.note, lat: b.lat!, lon: b.lon!, ward: b.ward });
       return { ai_available: true, advisory };
@@ -277,7 +278,7 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
   // an active, current-notice consent row for THAT feature. Missing, revoked or stale-notice
   // consent denies with 403 consent_required - no data flows before opt-in, no cross-feature bleed.
   const AI_NOTICE_VERSION = 'v1';
-  const AI_NOTICE_TEXT = 'NagarTrace AI features run on the operator\'s own computer, not on the NagarTrace server. Only the exact input for the feature you use is sent there (your question, the complaint fields you include, the photo you check, or the public contractor query). The connection is encrypted, but this processing is NOT end-to-end encrypted, and AI is unavailable when that computer is off. Answers are advisory and never change your report by themselves. You can revoke this consent at any time in Settings; revoking stops all further processing immediately.';
+  const AI_NOTICE_TEXT = 'NagarTrace AI features run on the operator\'s own computer, not on the NagarTrace server. Only the exact input of the feature you use is sent there: the guide receives your question; the email draft and report check receive the report details you enter (hazard, note, location coordinates, ward, complaint number); the photo check receives the photo itself plus its hazard and note; the contractor brief receives the contractor name you ask about, matched against public records. Nothing else is sent - no account data, no other reports, no IDs. The connection is encrypted, but this processing is NOT end-to-end encrypted, and AI is unavailable when that computer is off. Answers are advisory and never change your report by themselves. You can revoke consent per feature at any time; revocation stops all new processing immediately, but a request already sent at that moment cannot be recalled.';
   const AI_FEATURES = ['guide_chat', 'email_draft', 'photo_advisory', 'contractor_finder'] as const;
   type AiFeature = typeof AI_FEATURES[number];
   const aiConsentDeny = async (p: { userId: string }, feature: AiFeature) => {
@@ -289,6 +290,16 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
     if (aiOff) { aiDisabled(reply); return true; }
     if (aiScopeDeny(p)) { reply.code(403).send({ ai_available: false, reason: 'ai_not_allowed' }); return true; }
     if (await aiConsentDeny(p, feature)) { reply.code(403).send({ ai_available: false, reason: 'consent_required', notice_version: AI_NOTICE_VERSION }); return true; }
+    return false;
+  };
+  // Revoke race: consent is checked at route entry AND again immediately before dispatch, so a
+  // revoke landing while validation/retrieval runs still blocks the forward. A request already
+  // dispatched to the gateway in that same instant cannot be recalled - the notice says so.
+  const aiDispatchDeny = async (reply: any, p: { userId: string }, feature: AiFeature) => {
+    if (await aiConsentDeny(p, feature)) {
+      reply.code(403).send({ ai_available: false, reason: 'consent_required', notice_version: AI_NOTICE_VERSION });
+      return true;
+    }
     return false;
   };
   const aiDisabled = (reply: any) => reply.code(503).send({ ai_available: false, reason: 'ai_disabled' });
@@ -310,6 +321,7 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
     const budget = admitInference(principal.userId);
     if (!budget.ok) return reply.code(503).send({ ai_available: false, reason: budget.reason });
     try {
+      if (await aiDispatchDeny(reply, principal, 'guide_chat')) return; // re-check just before dispatch
       const out = await aiChat(aiCfg(), { message: b.message.trim(), context });
       return { ai_available: true, ...out };
     } catch (e) { return aiUnavailable(reply, e); } finally { budget.done(); }
@@ -331,6 +343,7 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
     const budget = admitInference(principal.userId);
     if (!budget.ok) return reply.code(503).send({ ai_available: false, reason: budget.reason });
     try {
+      if (await aiDispatchDeny(reply, principal, 'email_draft')) return; // re-check just before dispatch
       const out = await aiEmailDraft(aiCfg(), { hazard: b.hazard!, note: b.note, lat: b.lat!, lon: b.lon!, ward: b.ward, complaint_no: b.complaint_no });
       return { ai_available: true, ...out }; // draft only - no recipient, no send path exists here
     } catch (e) { return aiUnavailable(reply, e); } finally { budget.done(); }
@@ -350,6 +363,7 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
     const budget = admitInference(principal.userId);
     if (!budget.ok) return reply.code(503).send({ ai_available: false, reason: budget.reason });
     try {
+      if (await aiDispatchDeny(reply, principal, 'photo_advisory')) return; // re-check just before dispatch
       const out = await aiImageCheck(aiCfg(), { image_base64: b.image_base64.replace(/[\r\n]/g, ''), hazard: b.hazard, note: b.note });
       return { ai_available: true, advisory: out };
     } catch (e) { return aiUnavailable(reply, e); } finally { budget.done(); }
@@ -380,6 +394,7 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
     const budget = admitInference(principal.userId);
     if (!budget.ok) return reply.code(503).send({ ai_available: false, reason: budget.reason });
     try {
+      if (await aiDispatchDeny(reply, principal, 'contractor_finder')) return; // re-check just before dispatch
       const out = await aiContractorBrief(aiCfg(), rows);
       return { ai_available: true, found: true, brief: out, candidate_warning: CANDIDATE_WARNING };
     } catch (e) { return aiUnavailable(reply, e); } finally { budget.done(); }
