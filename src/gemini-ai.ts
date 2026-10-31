@@ -27,6 +27,13 @@ export type GeminiConfig = {
   timeoutMs: number;
 };
 
+/** Sniff the real image type from the base64 payload header - never trust a hardcoded mime. */
+export function sniffImageMime(b64: string): 'image/jpeg' | 'image/png' {
+  const head = Buffer.from(b64.slice(0, 16), 'base64')
+  if (head.length >= 4 && head[0] === 0x89 && head[1] === 0x50 && head[2] === 0x4e && head[3] === 0x47) return 'image/png'
+  return 'image/jpeg' // JPEG (ffd8) and anything unrecognized: the API treats it as jpeg
+}
+
 const API_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
 
 function requireKey(cfg: GeminiConfig): string {
@@ -38,7 +45,7 @@ async function callGemini(cfg: GeminiConfig, system: string, user: string, image
   const key = requireKey(cfg);
   const parts: Record<string, unknown>[] = [{ text: user }];
   for (const b64 of images ?? []) {
-    parts.push({ inline_data: { mime_type: 'image/jpeg', data: b64 } });
+    parts.push({ inline_data: { mime_type: sniffImageMime(b64), data: b64 } });
   }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), cfg.timeoutMs);
@@ -55,7 +62,8 @@ async function callGemini(cfg: GeminiConfig, system: string, user: string, image
       redirect: 'error',
     });
     const body = await res.text();
-    if (!res.ok) throw new LaptopAiError('laptop_unreachable', `gemini ${res.status}: ${body.slice(0, 200)}`);
+    // Upstream error bodies stay out of our errors entirely: status only, no Google payload.
+    if (!res.ok) throw new LaptopAiError('laptop_unreachable', `gemini http ${res.status}`);
     let json: any;
     try { json = JSON.parse(body); } catch { throw new LaptopAiError('bad_output', 'gemini returned non-JSON envelope'); }
     const text = json?.candidates?.[0]?.content?.parts?.map((p: any) => p?.text ?? '').join('') ?? '';
@@ -73,13 +81,11 @@ async function callGemini(cfg: GeminiConfig, system: string, user: string, image
 const JSON_SYSTEM = 'You are the road-hazard assistant inside the NagarTrace civic app. Answer ONLY with the JSON object the user prompt describes - no markdown fences, no commentary. Never invent official records, complaint numbers or guarantees; if something is not visible or unknown, say so inside the JSON.';
 
 export async function geminiStatus(cfg: GeminiConfig): Promise<{ configured: boolean; available: boolean; model?: string; reason?: string }> {
+  // CONFIG-ONLY on purpose: a status poll must never place an outbound model call
+  // (cost + data-egress on an unauthenticated-adjacent probe). Availability is only
+  // proven by a real consented feature call, which reports its own errors.
   if (!cfg.apiKey) return { configured: false, available: false, reason: 'not_configured' };
-  try {
-    await callGemini(cfg, 'Reply with the single word: ok', 'ping');
-    return { configured: true, available: true, model: cfg.model };
-  } catch (e) {
-    return { configured: true, available: false, reason: e instanceof LaptopAiError ? e.reason : 'laptop_unreachable' };
-  }
+  return { configured: true, available: true, model: cfg.model, reason: 'config only - not verified by a live call' };
 }
 
 export async function reportCheck(cfg: GeminiConfig, input: { hazard: string; note?: string; lat: number; lon: number; ward?: string }): Promise<Advisory> {

@@ -401,6 +401,33 @@ test('consented mode: per-feature consent required, grant unlocks ONLY that feat
   } finally { await w.close(); }
 });
 
+test('gemini provider: notice flips to v2 (Google terms), v1 grants denied cross-provider, parked key alone keeps v1', async () => {
+  // Provider explicit + key: notice v2 names Google and the free-tier training term.
+  const w = await newWorld({ aiAccessMode: 'consented', aiProvider: 'gemini', geminiApiKey: 'test-key' });
+  try {
+    const u = client(w, await userToken('gem-consent-u'));
+    const n = await u.get('/v1/ai/consent-notice');
+    assert.equal(n.status, 200);
+    assert.equal(n.json.version, 'v2');
+    assert.match(n.json.text, /Google Gemini/);
+    assert.match(n.json.text, /free tier Google may use submitted content to improve its products/);
+    // A v1 (laptop-era) grant attempt is rejected - no cross-provider consent carryover:
+    const stale = await u.post('/v1/ai/consents', { feature: 'guide_chat', notice_version: 'v1' });
+    assert.equal(stale.status, 409);
+    assert.equal(stale.json.error, 'stale_notice');
+    // Granting at v2 unlocks the feature (hits honest provider error, not consent denial):
+    assert.equal((await u.post('/v1/ai/consents', { feature: 'guide_chat', notice_version: 'v2' })).status, 200);
+  } finally { await w.close(); }
+  // Parked key WITHOUT the explicit provider setting: laptop semantics, notice stays v1.
+  const w2 = await newWorld({ aiAccessMode: 'consented', geminiApiKey: 'test-key' });
+  try {
+    const u2 = client(w2, await userToken('gem-parked-u'));
+    const n2 = await u2.get('/v1/ai/consent-notice');
+    assert.equal(n2.json.version, 'v1');
+    assert.ok(!n2.json.text.includes('Google Gemini'));
+  } finally { await w2.close(); }
+});
+
 test('revoke mid-flight: dispatched request completes honestly; every NEW dispatch denied after revoke, gateway never sees it', async () => {
   const realFetch = globalThis.fetch;
   const received: any[] = [];

@@ -37,6 +37,8 @@ export type Config = {
   laptopAiModel: string;
   laptopAiTimeoutMs: number;
   /** Google AI Studio key; when set the assistant routes use Gemini instead of the laptop gateway. Server-side only. */
+  /** Explicit assistant provider. 'gemini' routes AI calls to Google (requires GEMINI_API_KEY); anything else keeps the laptop gateway. A parked GEMINI_API_KEY alone never reroutes traffic. */
+  aiProvider: 'laptop' | 'gemini';
   geminiApiKey?: string;
   geminiModel: string;
   /** 'off' (default): every /v1/ai/* route refuses, even when LAPTOP_AI_URL is set - hard kill
@@ -81,6 +83,7 @@ export function defaults(): Omit<Config, 'authIssuer' | 'authAudience' | 'databa
     photoRequired: false, // flipped by the deployment owner after the photo-staging client is live
     laptopAiModel: 'qwen3.5:4b',
     laptopAiTimeoutMs: 25000,
+    aiProvider: 'laptop' as const,
     geminiModel: 'gemini-2.5-flash',
     aiAccessMode: 'off',
     aiAllowedSubjects: [] as string[],
@@ -142,6 +145,7 @@ export function fromEnv(env = process.env): Config {
     aiAllowedSubjects,
     laptopAiModel: env.LAPTOP_AI_MODEL ?? 'qwen3.5:4b',
     laptopAiTimeoutMs: Number(env.LAPTOP_AI_TIMEOUT_MS ?? 25000),
+    aiProvider: env.AI_PROVIDER === 'gemini' ? ('gemini' as const) : ('laptop' as const),
     geminiApiKey: env.GEMINI_API_KEY || undefined,
     geminiModel: env.GEMINI_MODEL ?? 'gemini-2.5-flash',
     followupPipeline: env.FOLLOWUP_PIPELINE === 'true',

@@ -13,7 +13,7 @@ function mockFetch(t: test.TestContext, replyText: string) {
   return calls
 }
 
-const CFG = { model: 'qwen3.5:4b', timeoutMs: 5000, geminiKey: 'test-key', geminiModel: 'gemini-2.5-flash' }
+const CFG = { provider: 'gemini' as const, model: 'qwen3.5:4b', timeoutMs: 5000, geminiKey: 'test-key', geminiModel: 'gemini-2.5-flash' }
 
 test('gemini provider: report-check hits generateContent with server-side key header', async (t) => {
   const calls = mockFetch(t, ADVISORY)
@@ -32,10 +32,32 @@ test('gemini provider: image-check sends the photo as inline_data and parses mis
   assert.equal(parts[1].inline_data.data, 'QUJD')
 })
 
-test('gemini provider: status reports the gemini model when key set', async (t) => {
-  mockFetch(t, 'ok')
+test('gemini provider: status is config-only - no outbound call, key presence only', async (t) => {
+  const calls = mockFetch(t, 'ok')
   const s = await laptopAiStatus(CFG)
-  assert.deepEqual(s, { configured: true, available: true, model: 'gemini-2.5-flash' })
+  assert.equal(s.configured, true)
+  assert.equal(s.available, true)
+  assert.equal(s.model, 'gemini-2.5-flash')
+  assert.equal(calls.length, 0) // a status poll must never place a model call
+  const s2 = await laptopAiStatus({ ...CFG, geminiKey: undefined })
+  assert.deepEqual(s2, { configured: false, available: false, reason: 'not_configured' })
+  assert.equal(calls.length, 0)
+})
+
+test('provider selection is explicit: parked key + provider laptop never calls Google', async (t) => {
+  const calls = mockFetch(t, ADVISORY)
+  const laptopCfg = { provider: 'laptop' as const, model: 'qwen3.5:4b', timeoutMs: 5000, geminiKey: 'test-key', geminiModel: 'gemini-2.5-flash' }
+  await assert.rejects(reportCheck(laptopCfg, { hazard: 'pothole', lat: 1, lon: 1 }), /not configured|misconfigured|not_configured/)
+  assert.equal(calls.filter((c) => c.url.includes('googleapis')).length, 0)
+})
+
+test('mime sniffing: png header routes to image/png, jpeg default', async (t) => {
+  const calls = mockFetch(t, ADVISORY)
+  const pngB64 = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]).toString('base64')
+  await imageCheck(CFG, { image_base64: pngB64, hazard: 'pothole' })
+  assert.equal(calls[0].body.contents[0].parts[1].inline_data.mime_type, 'image/png')
+  await imageCheck(CFG, { image_base64: '/9j/4AAQSkZJRg==', hazard: 'pothole' })
+  assert.equal(calls[1].body.contents[0].parts[1].inline_data.mime_type, 'image/jpeg')
 })
 
 test('gemini provider: chat parses reply json', async (t) => {

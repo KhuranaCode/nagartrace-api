@@ -29,20 +29,24 @@ import {
   reportCheck as geminiReportCheck,
 } from './gemini-ai.ts';
 
-export type AiProviderConfig = LaptopAiConfig & { geminiKey?: string; geminiModel?: string };
+export type AiProviderConfig = LaptopAiConfig & { provider: 'laptop' | 'gemini'; geminiKey?: string; geminiModel?: string };
 export { admitInference, admitReportCheck, admitStatus, LaptopAiError };
 export type { Advisory, ChatReply, ContractorBrief, EmailDraft, LaptopAiConfig };
 
+// Provider is chosen ONLY by the explicit AI_PROVIDER setting. A key sitting in
+// the env (e.g. parked early) must never by itself reroute user data to Google:
+// provider 'laptop' + a set GEMINI_API_KEY still uses the laptop path.
+const useGemini = (c: AiProviderConfig) => c.provider === 'gemini';
 const g = (c: AiProviderConfig) => ({ apiKey: c.geminiKey, model: c.geminiModel ?? 'gemini-2.5-flash', timeoutMs: c.timeoutMs });
 
-export const laptopAiStatus = (c: AiProviderConfig) => (c.geminiKey ? geminiStatus(g(c)) : laptopStatus(c));
+export const laptopAiStatus = (c: AiProviderConfig) => (useGemini(c) ? geminiStatus(g(c)) : laptopStatus(c));
 export const reportCheck = (c: AiProviderConfig, i: { hazard: string; note?: string; lat: number; lon: number; ward?: string }): Promise<Advisory> =>
-  (c.geminiKey ? geminiReportCheck(g(c), i) : laptopReportCheck(c, i));
+  (useGemini(c) ? geminiReportCheck(g(c), i) : laptopReportCheck(c, i));
 export const chat = (c: AiProviderConfig, i: { message: string; context?: Record<string, unknown> | null }): Promise<ChatReply> =>
-  (c.geminiKey ? geminiChat(g(c), i) : laptopChat(c, i));
+  (useGemini(c) ? geminiChat(g(c), i) : laptopChat(c, i));
 export const imageCheck = (c: AiProviderConfig, i: { image_base64: string; hazard?: string; note?: string }): Promise<Advisory> =>
-  (c.geminiKey ? geminiImageCheck(g(c), i) : laptopImageCheck(c, i));
+  (useGemini(c) ? geminiImageCheck(g(c), i) : laptopImageCheck(c, i));
 export const emailDraft = (c: AiProviderConfig, i: { hazard: string; note?: string; lat: number; lon: number; ward?: string; complaint_no?: string }): Promise<EmailDraft> =>
-  (c.geminiKey ? geminiEmailDraft(g(c), i) : laptopEmailDraft(c, i));
+  (useGemini(c) ? geminiEmailDraft(g(c), i) : laptopEmailDraft(c, i));
 export const contractorBrief = (c: AiProviderConfig, rows: Record<string, unknown>[]): Promise<ContractorBrief> =>
-  (c.geminiKey ? geminiContractorBrief(g(c), rows) : laptopContractorBrief(c, rows));
+  (useGemini(c) ? geminiContractorBrief(g(c), rows) : laptopContractorBrief(c, rows));

@@ -193,7 +193,7 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
   app.get('/v1/ai/status', async (req) => {
     await auth(req); // signed-in users only; no public inference probe
     if (aiOff) return { ai_available: false, reason: 'ai_disabled' }; // no config details leak when disabled
-    return laptopAiStatus({ url: cfg.laptopAiUrl, token: cfg.laptopAiToken, model: cfg.laptopAiModel, timeoutMs: cfg.laptopAiTimeoutMs });
+    return laptopAiStatus(aiCfg());
   });
 
   // ---------- AI consent (all-users lane) ----------
@@ -251,7 +251,7 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
     if (!budget.ok) return reply.code(503).send({ ai_available: false, reason: budget.reason });
     try {
       if (await aiDispatchDeny(reply, principal, 'report_check')) return; // re-check just before dispatch
-      const advisory = await reportCheck({ url: cfg.laptopAiUrl, token: cfg.laptopAiToken, model: cfg.laptopAiModel, timeoutMs: cfg.laptopAiTimeoutMs },
+      const advisory = await reportCheck(aiCfg(),
         { hazard: b.hazard!, note: b.note, lat: b.lat!, lon: b.lon!, ward: b.ward });
       return { ai_available: true, advisory };
     } catch (e) {
@@ -264,7 +264,7 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
     }
   });
 
-  const aiCfg = (): AiProviderConfig => ({ url: cfg.laptopAiUrl, token: cfg.laptopAiToken, model: cfg.laptopAiModel, timeoutMs: cfg.laptopAiTimeoutMs, geminiKey: cfg.geminiApiKey, geminiModel: cfg.geminiModel });
+  const aiCfg = (): AiProviderConfig => ({ url: cfg.laptopAiUrl, token: cfg.laptopAiToken, model: cfg.laptopAiModel, timeoutMs: cfg.laptopAiTimeoutMs, provider: cfg.aiProvider, geminiKey: cfg.geminiApiKey, geminiModel: cfg.geminiModel });
   const aiUnavailable = (reply: any, e: unknown) => {
     if (e instanceof LaptopAiError) return reply.code(503).send({ ai_available: false, reason: e.reason });
     throw e;
@@ -288,7 +288,7 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
   // The notice is provider-specific: it must name where the input actually goes.
   // Switching providers via config changes the served version, which forces
   // re-consent - a grant under v1 (operator laptop) never arms Gemini (v2).
-  const gemini = !!cfg.geminiApiKey;
+  const gemini = cfg.aiProvider === 'gemini' && !!cfg.geminiApiKey;
   const AI_NOTICE_VERSION = gemini ? 'v2' : 'v1';
   const AI_NOTICE_TEXT = gemini
     ? 'NagarTrace AI features send your input to Google Gemini, a third-party AI service - not to a computer operated by the team. Only the exact input of the feature you use is sent. The guide receives your question. The report check receives the report details you enter (hazard, note, location coordinates, ward). The photo check receives the photo itself plus its hazard and note. The email draft receives the report details you enter (hazard, note, location coordinates, ward) plus the complaint reference only if you choose to include it. The contractor brief looks up the contractor name you enter in a public award registry and sends the matching public records (project name, state, length, award date, awarded cost, executing agency, mode, stage, type, source label). No account identifiers or internal IDs are sent, and no reports other than the fields you just typed. The connection is encrypted, but this processing is NOT end-to-end encrypted: Google processes your input under its own terms, and on the Gemini free tier Google may use submitted content to improve its products (the paid tier does not). Answers are advisory and never change your report by themselves. You can revoke consent per feature at any time; revocation stops new processing, but a request already sent at that moment cannot be recalled.'
