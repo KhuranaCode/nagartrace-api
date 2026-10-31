@@ -36,7 +36,9 @@ for f in "$HOME/.ollama/logs/server.log" /var/log/ollama.log /var/log/ollama/*.l
   [ -e "$f" ] && { ls -la "$f"; found=1; }
 done
 [ "$found" = 0 ] && echo "no ollama file logs found; journald check:"
-journalctl -u ollama --no-pager -n 1 -o short-iso 2>/dev/null | cut -c1-40 || echo "no ollama journal unit"
+# Metadata ONLY: timestamp of the newest journal line, never its content (a log line can hold prompt text).
+journalctl -u ollama --no-pager -n 1 -o short-iso 2>/dev/null | awk '{print "newest ollama journal entry at:", $1}' || echo "no ollama journal unit"
+echo "journal line count (volume hint only): $(journalctl -u ollama --no-pager 2>/dev/null | wc -l)"
 
 out "gateway wrapper (presence + the two facts the privacy claims need)"
 pgrep -af "ai-gateway.py" >/dev/null && echo "ai-gateway.py: running" || echo "ai-gateway.py: NOT running"
