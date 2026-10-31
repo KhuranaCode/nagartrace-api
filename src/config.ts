@@ -36,6 +36,9 @@ export type Config = {
   laptopAiToken?: string;
   laptopAiModel: string;
   laptopAiTimeoutMs: number;
+  /** Google AI Studio key; when set the assistant routes use Gemini instead of the laptop gateway. Server-side only. */
+  geminiApiKey?: string;
+  geminiModel: string;
   /** 'off' (default): every /v1/ai/* route refuses, even when LAPTOP_AI_URL is set - hard kill
    *  so a mis-deployed env can never carry real user text/photos to the laptop gateway.
    *  'test': routes enabled for LOCAL synthetic testing only; must never be set on the
@@ -78,6 +81,7 @@ export function defaults(): Omit<Config, 'authIssuer' | 'authAudience' | 'databa
     photoRequired: false, // flipped by the deployment owner after the photo-staging client is live
     laptopAiModel: 'qwen3.5:4b',
     laptopAiTimeoutMs: 25000,
+    geminiModel: 'gemini-2.5-flash',
     aiAccessMode: 'off',
     aiAllowedSubjects: [] as string[],
     rateLimitMax: 120,
@@ -138,6 +142,8 @@ export function fromEnv(env = process.env): Config {
     aiAllowedSubjects,
     laptopAiModel: env.LAPTOP_AI_MODEL ?? 'qwen3.5:4b',
     laptopAiTimeoutMs: Number(env.LAPTOP_AI_TIMEOUT_MS ?? 25000),
+    geminiApiKey: env.GEMINI_API_KEY || undefined,
+    geminiModel: env.GEMINI_MODEL ?? 'gemini-2.5-flash',
     followupPipeline: env.FOLLOWUP_PIPELINE === 'true',
     mainAdminSubject: env.MAIN_ADMIN_SUBJECT?.trim() || undefined,
   } as Config;

@@ -4,7 +4,7 @@ import { z } from 'zod';
 import type pg from 'pg';
 import type { Config } from './config.ts';
 import { authenticate, HttpError, isMainAdmin, memberships, type KeyResolver, type Membership, type Principal } from './auth.ts';
-import { admitReportCheck, admitInference, laptopAiStatus, reportCheck, chat as aiChat, emailDraft as aiEmailDraft, imageCheck as aiImageCheck, contractorBrief as aiContractorBrief, LaptopAiError, type LaptopAiConfig } from './laptop-ai.ts';
+import { admitReportCheck, admitInference, laptopAiStatus, reportCheck, chat as aiChat, emailDraft as aiEmailDraft, imageCheck as aiImageCheck, contractorBrief as aiContractorBrief, LaptopAiError, type AiProviderConfig } from './ai-provider.ts';
 import { awardPoints, deadlineHours, lockIssue, recordEvent, routeIssue, runEscalations, severityOf, transition } from './domain.ts';
 import { registerStreakRoutes } from './streaks.ts';
 import { registerFollowupRoutes } from './followup.ts';
@@ -264,7 +264,7 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
     }
   });
 
-  const aiCfg = (): LaptopAiConfig => ({ url: cfg.laptopAiUrl, token: cfg.laptopAiToken, model: cfg.laptopAiModel, timeoutMs: cfg.laptopAiTimeoutMs });
+  const aiCfg = (): AiProviderConfig => ({ url: cfg.laptopAiUrl, token: cfg.laptopAiToken, model: cfg.laptopAiModel, timeoutMs: cfg.laptopAiTimeoutMs, geminiKey: cfg.geminiApiKey, geminiModel: cfg.geminiModel });
   const aiUnavailable = (reply: any, e: unknown) => {
     if (e instanceof LaptopAiError) return reply.code(503).send({ ai_available: false, reason: e.reason });
     throw e;
