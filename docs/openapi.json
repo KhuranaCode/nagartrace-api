@@ -1457,6 +1457,72 @@
      }
     }
    }
+  },
+  "/v1/ai/consent-notice": {
+   "get": {
+    "summary": "Public: current AI disclosure notice (version + text + feature list) shown before opt-in",
+    "responses": {
+     "200": {
+      "description": "OK"
+     },
+     "4XX": {
+      "description": "{error,message}"
+     }
+    },
+    "security": []
+   }
+  },
+  "/v1/ai/consents": {
+   "get": {
+    "summary": "List my AI feature consents (feature, notice_version, granted_at, revoked_at)",
+    "security": [
+     {
+      "bearer": []
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "{notice_version,consents[]}"
+     },
+     "4XX": {
+      "description": "{error,message}"
+     }
+    }
+   },
+   "post": {
+    "summary": "Grant consent for one AI feature; requires the CURRENT notice_version (409 stale_notice otherwise); audited",
+    "security": [
+     {
+      "bearer": []
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "{ok,feature,notice_version}"
+     },
+     "4XX": {
+      "description": "{error,message}"
+     }
+    }
+   }
+  },
+  "/v1/ai/consents/revoke": {
+   "post": {
+    "summary": "Revoke consent for one AI feature; deny takes effect immediately; audited",
+    "security": [
+     {
+      "bearer": []
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     },
+     "4XX": {
+      "description": "{error,message}"
+     }
+    }
+   }
   }
  }
 }

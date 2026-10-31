@@ -40,7 +40,10 @@ export type Config = {
    *  so a mis-deployed env can never carry real user text/photos to the laptop gateway.
    *  'test': routes enabled for LOCAL synthetic testing only; must never be set on the
    *  production service. Any real-user AI processing needs a separate owner-approved route. */
-  aiAccessMode: 'off' | 'test' | 'scoped';
+  // 'off': nothing processed. 'test': synthetic harness only (banned in prod). 'scoped': exact
+  // listed subjects only (owner-real lane). 'consented': any signed-in user WITH an active,
+  // current-notice, per-feature consent row (db 016) - all-users lane, deny-by-default.
+  aiAccessMode: 'off' | 'test' | 'scoped' | 'consented';
   /** Per-principal AI activation scope ('scoped' mode ONLY): exact auth subjects allowed to use AI
    *  routes with real input. Deny-by-default: an unlisted principal gets nothing. Empty in scoped
    *  mode is a boot error - scoped-with-no-subjects must never silently allow or silently work. */
@@ -131,7 +134,7 @@ export function fromEnv(env = process.env): Config {
     photoRequired: env.PHOTO_REQUIRED === 'true',
     laptopAiUrl: env.LAPTOP_AI_URL || undefined,
     laptopAiToken: env.LAPTOP_AI_TOKEN || undefined,
-    aiAccessMode: env.AI_ACCESS_MODE === 'test' ? 'test' : env.AI_ACCESS_MODE === 'scoped' ? 'scoped' : 'off',
+    aiAccessMode: env.AI_ACCESS_MODE === 'test' ? 'test' : env.AI_ACCESS_MODE === 'scoped' ? 'scoped' : env.AI_ACCESS_MODE === 'consented' ? 'consented' : 'off',
     aiAllowedSubjects,
     laptopAiModel: env.LAPTOP_AI_MODEL ?? 'qwen3.5:4b',
     laptopAiTimeoutMs: Number(env.LAPTOP_AI_TIMEOUT_MS ?? 25000),

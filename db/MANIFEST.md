@@ -13,6 +13,8 @@ db/, db-pending/, and confirm with the infra peer.
 | 011 | followup reminder pipeline | RESERVED - in db-pending/, held for review-gated apply |
 | 012 | complaint IDs (complaint_no sequence) | applied on main (f188141), live |
 | 013 | multiple hazards per report/issue | branch release/013-multi-hazard (clean tree off live 075665b), pending independent review + coordinated apply |
+| 015 | report source links (optional news/social URL evidence) | RESERVED - lane feat/report-source-links, review-gated |
+| 016 | per-user per-feature AI processing consent (versioned, revocable) | branch feat/ai-laptop-candidate-clean, pending independent review + coordinated apply |
 
 Collision history: complaint IDs were first drafted as 009 (collided with road), then 010
 (collided with NHAI draft). Do not renumber into a reserved slot; pick the next free number

@@ -196,10 +196,42 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
     return laptopAiStatus({ url: cfg.laptopAiUrl, token: cfg.laptopAiToken, model: cfg.laptopAiModel, timeoutMs: cfg.laptopAiTimeoutMs });
   });
 
+  // ---------- AI consent (all-users lane) ----------
+  // The disclosure notice the user must see before opting in. Public: consent UIs need it signed-out too.
+  app.get('/v1/ai/consent-notice', async () => ({ version: AI_NOTICE_VERSION, text: AI_NOTICE_TEXT, features: AI_FEATURES }));
+
+  app.get('/v1/ai/consents', async (req) => {
+    const p = await auth(req);
+    const r = await db.query('SELECT feature, notice_version, granted_at, revoked_at FROM ai_consents WHERE user_id=$1 ORDER BY feature', [p.userId]);
+    return { notice_version: AI_NOTICE_VERSION, consents: r.rows };
+  });
+
+  app.post('/v1/ai/consents', async (req) => {
+    const p = await auth(req);
+    const b = parse(z.object({ feature: z.enum(AI_FEATURES), notice_version: z.string().max(20) }).strict(), req.body);
+    // Stale or wrong notice version cannot grant: the user must have seen the CURRENT notice.
+    if (b.notice_version !== AI_NOTICE_VERSION) throw new HttpError(409, 'Consent notice is outdated - read the current notice and confirm again.', 'stale_notice');
+    await tx(async (c) => {
+      await c.query(`INSERT INTO ai_consents (user_id, feature, notice_version) VALUES ($1,$2,$3)
+        ON CONFLICT (user_id, feature) DO UPDATE SET notice_version=$3, granted_at=now(), revoked_at=NULL`, [p.userId, b.feature, AI_NOTICE_VERSION]);
+      await c.query('INSERT INTO ai_consent_events (user_id, feature, action, notice_version) VALUES ($1,$2,$3,$4)', [p.userId, b.feature, 'granted', AI_NOTICE_VERSION]);
+    });
+    return { ok: true, feature: b.feature, notice_version: AI_NOTICE_VERSION };
+  });
+
+  app.post('/v1/ai/consents/revoke', async (req) => {
+    const p = await auth(req);
+    const b = parse(z.object({ feature: z.enum(AI_FEATURES) }).strict(), req.body);
+    await tx(async (c) => {
+      await c.query('UPDATE ai_consents SET revoked_at=now() WHERE user_id=$1 AND feature=$2 AND revoked_at IS NULL', [p.userId, b.feature]);
+      await c.query('INSERT INTO ai_consent_events (user_id, feature, action, notice_version) VALUES ($1,$2,$3,$4)', [p.userId, b.feature, 'revoked', AI_NOTICE_VERSION]);
+    });
+    return { ok: true, feature: b.feature, revoked: true };
+  });
+
   app.post('/v1/ai/report-check', { bodyLimit: 8 * 1024 }, async (req, reply) => {
     const principal = await auth(req);
-    if (aiOff) return aiDisabled(reply); // hard kill-switch: no user content is processed while disabled
-    if (aiScopeDeny(principal)) return reply.code(403).send({ ai_available: false, reason: 'ai_not_allowed' }); // scoped mode: unlisted principal, deny-by-default
+    if (await aiGate(reply, principal, 'photo_advisory')) return; // kill-switch + scope + per-feature consent, all deny-by-default
     // Validate BEFORE taking a budget slot: a rejected request must never consume one.
     const b = (req.body ?? {}) as { hazard?: string; note?: string; lat?: number; lon?: number; ward?: string };
     const hazardOk = typeof b.hazard === 'string' && (HAZARDS as readonly string[]).includes(b.hazard);
@@ -241,14 +273,31 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
   // owner's explicit per-principal activation; an unset list cannot boot (config enforces).
   const aiOff = cfg.aiAccessMode === 'off';
   const aiScopeDeny = (p: { subject: string }) => cfg.aiAccessMode === 'scoped' && !cfg.aiAllowedSubjects.includes(p.subject);
+  // All-users lane ('consented' mode): an AI content route may process a user's input ONLY with
+  // an active, current-notice consent row for THAT feature. Missing, revoked or stale-notice
+  // consent denies with 403 consent_required - no data flows before opt-in, no cross-feature bleed.
+  const AI_NOTICE_VERSION = 'v1';
+  const AI_NOTICE_TEXT = 'NagarTrace AI features run on the operator\'s own computer, not on the NagarTrace server. Only the exact input for the feature you use is sent there (your question, the complaint fields you include, the photo you check, or the public contractor query). The connection is encrypted, but this processing is NOT end-to-end encrypted, and AI is unavailable when that computer is off. Answers are advisory and never change your report by themselves. You can revoke this consent at any time in Settings; revoking stops all further processing immediately.';
+  const AI_FEATURES = ['guide_chat', 'email_draft', 'photo_advisory', 'contractor_finder'] as const;
+  type AiFeature = typeof AI_FEATURES[number];
+  const aiConsentDeny = async (p: { userId: string }, feature: AiFeature) => {
+    if (cfg.aiAccessMode !== 'consented') return false;
+    const r = await db.query('SELECT 1 FROM ai_consents WHERE user_id=$1 AND feature=$2 AND revoked_at IS NULL AND notice_version=$3', [p.userId, feature, AI_NOTICE_VERSION]);
+    return r.rowCount === 0;
+  };
+  const aiGate = async (reply: any, p: { userId: string; subject: string }, feature: AiFeature) => {
+    if (aiOff) { aiDisabled(reply); return true; }
+    if (aiScopeDeny(p)) { reply.code(403).send({ ai_available: false, reason: 'ai_not_allowed' }); return true; }
+    if (await aiConsentDeny(p, feature)) { reply.code(403).send({ ai_available: false, reason: 'consent_required', notice_version: AI_NOTICE_VERSION }); return true; }
+    return false;
+  };
   const aiDisabled = (reply: any) => reply.code(503).send({ ai_available: false, reason: 'ai_disabled' });
 
   // Citizen chat = multilingual PLATFORM GUIDE only. No issue/report reads, no tools:
   // user text is the question, never a source of facts, and the model sees no account data.
   app.post('/v1/ai/chat', { bodyLimit: 8 * 1024 }, async (req, reply) => {
     const principal = await auth(req);
-    if (aiOff) return aiDisabled(reply); // hard kill-switch: no user content is processed while disabled
-    if (aiScopeDeny(principal)) return reply.code(403).send({ ai_available: false, reason: 'ai_not_allowed' }); // scoped mode: unlisted principal, deny-by-default
+    if (await aiGate(reply, principal, 'guide_chat')) return; // kill-switch + scope + per-feature consent, all deny-by-default
     const b = (req.body ?? {}) as { message?: string; issue_id?: string };
     if (typeof b.message !== 'string' || b.message.trim().length === 0 || b.message.length > 1000) {
       throw new HttpError(400, 'message (1..1000 chars) is required.', 'bad_request');
@@ -270,8 +319,7 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
   // reviews, chooses a recipient for, and sends themselves. draft:true is part of the contract.
   app.post('/v1/ai/email-draft', { bodyLimit: 8 * 1024 }, async (req, reply) => {
     const principal = await auth(req);
-    if (aiOff) return aiDisabled(reply); // hard kill-switch: no user content is processed while disabled
-    if (aiScopeDeny(principal)) return reply.code(403).send({ ai_available: false, reason: 'ai_not_allowed' }); // scoped mode: unlisted principal, deny-by-default
+    if (await aiGate(reply, principal, 'email_draft')) return; // kill-switch + scope + per-feature consent, all deny-by-default
     const b = (req.body ?? {}) as { hazard?: string; note?: string; lat?: number; lon?: number; ward?: string; complaint_no?: string };
     const hazardOk = typeof b.hazard === 'string' && (HAZARDS as readonly string[]).includes(b.hazard);
     const latOk = typeof b.lat === 'number' && Number.isFinite(b.lat) && b.lat >= -90 && b.lat <= 90;
@@ -292,8 +340,7 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
   // honestly reports model_not_vision - a text model pretending to see is the failure we refuse.
   app.post('/v1/ai/image-check', { bodyLimit: 6 * 1024 * 1024 }, async (req, reply) => {
     const principal = await auth(req);
-    if (aiOff) return aiDisabled(reply); // hard kill-switch: no user content is processed while disabled
-    if (aiScopeDeny(principal)) return reply.code(403).send({ ai_available: false, reason: 'ai_not_allowed' }); // scoped mode: unlisted principal, deny-by-default
+    if (await aiGate(reply, principal, 'photo_advisory')) return; // kill-switch + scope + per-feature consent, all deny-by-default
     const b = (req.body ?? {}) as { image_base64?: string; hazard?: string; note?: string };
     if (typeof b.image_base64 !== 'string' || b.image_base64.length < 100 || b.image_base64.length > 5_800_000 || !/^[A-Za-z0-9+/=\r\n]+$/.test(b.image_base64)) {
       throw new HttpError(400, 'image_base64 (100..5.8M base64 chars) is required.', 'bad_request');
@@ -313,8 +360,7 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
   // model can never invent a track record. Candidate uncertainty warning travels with results.
   app.post('/v1/ai/contractor-brief', { bodyLimit: 8 * 1024 }, async (req, reply) => {
     const principal = await auth(req);
-    if (aiOff) return aiDisabled(reply); // hard kill-switch: no user content is processed while disabled
-    if (aiScopeDeny(principal)) return reply.code(403).send({ ai_available: false, reason: 'ai_not_allowed' }); // scoped mode: unlisted principal, deny-by-default
+    if (await aiGate(reply, principal, 'contractor_finder')) return; // kill-switch + scope + per-feature consent, all deny-by-default
     const b = (req.body ?? {}) as { contractor_name?: string };
     if (typeof b.contractor_name !== 'string' || b.contractor_name.trim().length < 2 || b.contractor_name.length > 120) {
       throw new HttpError(400, 'contractor_name (2..120 chars) is required.', 'bad_request');

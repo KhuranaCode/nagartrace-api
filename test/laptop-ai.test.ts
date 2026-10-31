@@ -339,3 +339,43 @@ test('scoped mode with an empty allowlist cannot boot (fail closed, never silent
     if (origSubs !== undefined) process.env.AI_ALLOWED_SUBJECTS = origSubs;
   }
 });
+
+test('consented mode: per-feature consent required, grant unlocks ONLY that feature, revoke re-denies, stale notice rejected, no cross-user bleed', async () => {
+  const w = await newWorld({ aiAccessMode: 'consented' }); // laptop unconfigured
+  try {
+    const u = client(w, await userToken('consent-u'));
+    const other = client(w, await userToken('consent-other'));
+    // Notice is public and versioned:
+    const n = await u.get('/v1/ai/consent-notice');
+    assert.equal(n.status, 200); assert.equal(n.json.version, 'v1'); assert.ok(n.json.text.includes('NOT end-to-end encrypted'));
+    assert.deepEqual(n.json.features, ['guide_chat', 'email_draft', 'photo_advisory', 'contractor_finder']);
+    // No consent rows: every feature denies with consent_required BEFORE any input is processed:
+    for (const [path, body] of [
+      ['/v1/ai/chat', { message: 'how do I report?' }],
+      ['/v1/ai/email-draft', { hazard: 'pothole', lat: 30.7, lon: 76.7 }],
+      ['/v1/ai/report-check', { hazard: 'pothole', lat: 30.7, lon: 76.7 }],
+      ['/v1/ai/contractor-brief', { contractor_name: 'Acme' }],
+    ] as const) {
+      const r = await u.post(path, body);
+      assert.equal(r.status, 403, path); assert.equal(r.json.reason, 'consent_required');
+    }
+    // Stale/wrong notice version cannot grant:
+    assert.equal((await u.post('/v1/ai/consents', { feature: 'guide_chat', notice_version: 'v0' })).status, 409);
+    // Grant guide_chat with the current notice: unlocks ONLY guide_chat (cross-feature bleed check):
+    const g = await u.post('/v1/ai/consents', { feature: 'guide_chat', notice_version: 'v1' });
+    assert.equal(g.status, 200);
+    const chat = await u.post('/v1/ai/chat', { message: 'how do I report?' });
+    assert.equal(chat.status, 503); assert.equal(chat.json.reason, 'not_configured'); // passed consent, hit honest offline
+    assert.equal((await u.post('/v1/ai/email-draft', { hazard: 'pothole', lat: 30.7, lon: 76.7 })).status, 403); // email still denied
+    // Another user gains nothing from u's grant:
+    assert.equal((await other.post('/v1/ai/chat', { message: 'hi' })).status, 403);
+    // Consent listing shows the grant:
+    const list = await u.get('/v1/ai/consents');
+    assert.equal(list.json.consents.length, 1); assert.equal(list.json.consents[0].feature, 'guide_chat'); assert.equal(list.json.consents[0].revoked_at, null);
+    // Revoke re-denies immediately, and the audit trail recorded grant + revoke:
+    assert.equal((await u.post('/v1/ai/consents/revoke', { feature: 'guide_chat' })).status, 200);
+    assert.equal((await u.post('/v1/ai/chat', { message: 'hi' })).status, 403);
+    const evs = (await w.adminDb.query('SELECT action FROM ai_consent_events ORDER BY id')).rows.map((r) => r.action);
+    assert.deepEqual(evs, ['granted', 'revoked']);
+  } finally { await w.close(); }
+});
