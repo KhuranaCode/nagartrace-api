@@ -66,8 +66,42 @@ out "swap + tmp leftovers that could hold prompt bytes"
 swapon --show --noheadings 2>/dev/null | wc -l | xargs -I{} echo "active swap devices: {}"
 ls /tmp 2>/dev/null | grep -ciE "ollama|gateway" | xargs -I{} echo "ollama/gateway-looking tmp entries: {}"
 
+out "CONFIG FACTS: ollama systemd unit log/debug settings (only those keys, values are not secrets)"
+systemctl cat ollama 2>/dev/null | grep -iE "^Environment=.*(DEBUG|VERBOSE|LOG)" || echo "no log/debug env override in ollama unit (or unit unreadable)"
+systemctl show ollama -p LogLevelMax 2>/dev/null || true
+
+out "CONFIG FACTS: gateway launch hygiene (booleans only, no args/values printed)"
+pa=$(ps -eo args 2>/dev/null | grep "[a]i-gateway.py" | grep -ciE "token|bearer|NAGARTRACE")
+echo "gateway started with credential-looking CLI args: $([ "${pa:-0}" -gt 0 ] && echo YES-REVIEW || echo no)"
+hb=$(grep -cliE "NAGARTRACE_AI_TOKEN" "$HOME/.bash_history" "$HOME/.zsh_history" 2>/dev/null | wc -l)
+echo "AI token string present in shell history files: $([ "$hb" -gt 0 ] && echo YES-REVIEW || echo no)"
+gwf=""
+for f in "$HOME/nagartrace-gateway/ai-gateway.py" "$HOME/ai-gateway.py"; do [ -f "$f" ] && gwf="$f" && break; done
+if [ -n "$gwf" ]; then
+  w=$(grep -cE "print\(|logging\.|logger\.|write\(" "$gwf" 2>/dev/null || echo 0)
+  echo "gateway source contains write/print/logging callsites: $w (log_message override above says whether request logging is suppressed)"
+fi
+
+out "DECISIVE sentinel retention probe (synthetic unique string; only FOUND / not-found printed)"
+MODEL="${1:-qwen3.5:2b}"
+SENT="NTAUDIT$(date +%s)$$"
+disp=$(curl -sS -m 90 http://127.0.0.1:11434/api/generate -d "{\"model\":\"$MODEL\",\"prompt\":\"$SENT\",\"stream\":false}" >/dev/null 2>&1 && echo ok || echo FAILED)
+echo "synthetic sentinel dispatched to local ollama ($MODEL): $disp"
+if [ "$disp" = ok ]; then
+  sleep 2
+  J=$(journalctl -u ollama --no-pager 2>/dev/null | grep -c "$SENT" || true)
+  echo "sentinel in ollama journal: $([ "${J:-0}" -gt 0 ] && echo FOUND-RETENTION || echo not-found)"
+  L=$(grep -rl "$SENT" "$HOME/.ollama/logs" /var/log/ollama /var/log/ollama.log 2>/dev/null | wc -l)
+  echo "sentinel in ollama log files: $([ "$L" -gt 0 ] && echo FOUND-RETENTION || echo not-found)"
+  H=$(grep -rl "$SENT" "$HOME/.ollama/history" "$HOME/.ollama/history.txt" 2>/dev/null | wc -l)
+  echo "sentinel in ollama history files: $([ "$H" -gt 0 ] && echo FOUND-RETENTION || echo not-found)"
+  echo "INTERPRETATION: not-found on all three after a real generate = ollama does not persist prompt text on these surfaces (decisive for these surfaces). Any FOUND = retention exists - activation blocked."
+else
+  echo "ollama unreachable on 127.0.0.1:11434 - probe inconclusive, model not running?"
+fi
+
 out "done"
-echo "Metadata only: no file contents, env values or log lines were read. Safe to share as-is."
+echo "Report prints metadata only; raw values are processed locally and never enter it. Safe to share as-is."
 
 # HONEST SCOPE: this script reads local state and FILTERS it down to metadata before printing;
 # raw values are processed on the laptop and never printed into the report. Its findings are
