@@ -308,3 +308,34 @@ describe('laptop AI kill-switch (default off: no real user data to the laptop)',
     assert.throws(() => fromEnv(env as any), /AI_ACCESS_MODE=test cannot be used with NODE_ENV=production/);
   });
 });
+
+test('scoped mode: deny-by-default - unlisted principal gets 403 ai_not_allowed, listed principal reaches the config check', async () => {
+  const w = await newWorld({ aiAccessMode: 'scoped', aiAllowedSubjects: ['owner-real-1'] }); // laptop unconfigured
+  try {
+    const outsider = client(w, await userToken('someone-else'));
+    // Every AI route refuses the unlisted principal BEFORE any user content is processed:
+    assert.equal((await outsider.post('/v1/ai/report-check', { hazard: 'pothole', lat: 30.7, lon: 76.7 })).status, 403);
+    const chat = await outsider.post('/v1/ai/chat', { message: 'how does reporting work?' });
+    assert.equal(chat.status, 403); assert.equal(chat.json.reason, 'ai_not_allowed');
+    assert.equal((await outsider.post('/v1/ai/email-draft', { hazard: 'pothole', lat: 30.7, lon: 76.7 })).status, 403);
+    assert.equal((await outsider.post('/v1/ai/contractor-brief', { contractor_name: 'Acme' })).status, 403);
+    // The listed principal passes the scope gate (then hits the honest not_configured 503):
+    const listed = client(w, await userToken('owner-real-1'));
+    const r = await listed.post('/v1/ai/report-check', { hazard: 'pothole', lat: 30.7, lon: 76.7 });
+    assert.equal(r.status, 503); assert.equal(r.json.reason, 'not_configured');
+    // Availability status stays open to everyone (it leaks no config details when off):
+    const st = await outsider.get('/v1/ai/status'); assert.equal(st.status, 200);
+  } finally { await w.close(); }
+});
+
+test('scoped mode with an empty allowlist cannot boot (fail closed, never silently allows)', async () => {
+  const origMode = process.env.AI_ACCESS_MODE; const origSubs = process.env.AI_ALLOWED_SUBJECTS;
+  process.env.AI_ACCESS_MODE = 'scoped'; delete process.env.AI_ALLOWED_SUBJECTS;
+  try {
+    const { fromEnv } = await import('../src/config.ts');
+    assert.throws(() => fromEnv(), /AI_ALLOWED_SUBJECTS/);
+  } finally {
+    if (origMode === undefined) delete process.env.AI_ACCESS_MODE; else process.env.AI_ACCESS_MODE = origMode;
+    if (origSubs !== undefined) process.env.AI_ALLOWED_SUBJECTS = origSubs;
+  }
+});

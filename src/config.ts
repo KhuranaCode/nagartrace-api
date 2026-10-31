@@ -40,7 +40,11 @@ export type Config = {
    *  so a mis-deployed env can never carry real user text/photos to the laptop gateway.
    *  'test': routes enabled for LOCAL synthetic testing only; must never be set on the
    *  production service. Any real-user AI processing needs a separate owner-approved route. */
-  aiAccessMode: 'off' | 'test';
+  aiAccessMode: 'off' | 'test' | 'scoped';
+  /** Per-principal AI activation scope ('scoped' mode ONLY): exact auth subjects allowed to use AI
+   *  routes with real input. Deny-by-default: an unlisted principal gets nothing. Empty in scoped
+   *  mode is a boot error - scoped-with-no-subjects must never silently allow or silently work. */
+  aiAllowedSubjects: string[];
   /** Product requirement: new reports must bind a staged photo. FALSE during the client rollout window; the deployment owner sets PHOTO_REQUIRED=true once the web client stages photos. Server-enforced when true - no bypass route. */
   rateLimitMax: number;
   /** Follow-up reminder pipeline routes + sweep job. Default OFF; the deployment owner flips FOLLOWUP_PIPELINE=true AFTER migration 011 is applied (coordinated). When off, the routes return 404 and clients show the static honest fallback. */
@@ -72,6 +76,7 @@ export function defaults(): Omit<Config, 'authIssuer' | 'authAudience' | 'databa
     laptopAiModel: 'qwen3.5:4b',
     laptopAiTimeoutMs: 25000,
     aiAccessMode: 'off',
+    aiAllowedSubjects: [] as string[],
     rateLimitMax: 120,
     followupPipeline: false, // flipped by the deployment owner after migration 011 is applied
   };
@@ -97,6 +102,9 @@ export function fromEnv(env = process.env): Config {
   // sets AI_ACCESS_MODE=test on the production service, the process refuses to start.
   if (env.NODE_ENV === 'production' && env.AI_ACCESS_MODE === 'test')
     throw new Error('AI_ACCESS_MODE=test cannot be used with NODE_ENV=production');
+  const aiAllowedSubjects = (env.AI_ALLOWED_SUBJECTS ?? '').split(',').map((x) => x.trim()).filter(Boolean);
+  if (env.AI_ACCESS_MODE === 'scoped' && aiAllowedSubjects.length === 0)
+    throw new Error('AI_ACCESS_MODE=scoped requires AI_ALLOWED_SUBJECTS (exact auth subjects, deny-by-default)');
   if (!devDefaults) for (const [envKey, key] of Object.entries(POLICY_KEYS)) {
     const n = Number(need(envKey));
     if (!Number.isFinite(n) || n < 0) throw new Error(`${envKey} must be a non-negative number`);
@@ -123,7 +131,8 @@ export function fromEnv(env = process.env): Config {
     photoRequired: env.PHOTO_REQUIRED === 'true',
     laptopAiUrl: env.LAPTOP_AI_URL || undefined,
     laptopAiToken: env.LAPTOP_AI_TOKEN || undefined,
-    aiAccessMode: env.AI_ACCESS_MODE === 'test' ? 'test' : 'off',
+    aiAccessMode: env.AI_ACCESS_MODE === 'test' ? 'test' : env.AI_ACCESS_MODE === 'scoped' ? 'scoped' : 'off',
+    aiAllowedSubjects,
     laptopAiModel: env.LAPTOP_AI_MODEL ?? 'qwen3.5:4b',
     laptopAiTimeoutMs: Number(env.LAPTOP_AI_TIMEOUT_MS ?? 25000),
     followupPipeline: env.FOLLOWUP_PIPELINE === 'true',

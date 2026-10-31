@@ -199,6 +199,7 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
   app.post('/v1/ai/report-check', { bodyLimit: 8 * 1024 }, async (req, reply) => {
     const principal = await auth(req);
     if (aiOff) return aiDisabled(reply); // hard kill-switch: no user content is processed while disabled
+    if (aiScopeDeny(principal)) return reply.code(403).send({ ai_available: false, reason: 'ai_not_allowed' }); // scoped mode: unlisted principal, deny-by-default
     // Validate BEFORE taking a budget slot: a rejected request must never consume one.
     const b = (req.body ?? {}) as { hazard?: string; note?: string; lat?: number; lon?: number; ward?: string };
     const hazardOk = typeof b.hazard === 'string' && (HAZARDS as readonly string[]).includes(b.hazard);
@@ -234,7 +235,12 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
   // the laptop gateway, with or without consent). Default aiAccessMode 'off' refuses every AI route
   // even when LAPTOP_AI_URL is configured, so a mis-deployed env cannot carry user data.
   // 'test' is for local synthetic testing only and must never be set on production.
-  const aiOff = cfg.aiAccessMode !== 'test';
+  // AI activation gate. 'off': nothing processed. 'test': synthetic-harness mode (never in prod).
+  // 'scoped': real-input mode restricted to exact listed subjects - deny-by-default for everyone
+  // else (403 ai_not_allowed, distinct from the kill-switch's ai_disabled). The allowlist is the
+  // owner's explicit per-principal activation; an unset list cannot boot (config enforces).
+  const aiOff = cfg.aiAccessMode === 'off';
+  const aiScopeDeny = (p: { subject: string }) => cfg.aiAccessMode === 'scoped' && !cfg.aiAllowedSubjects.includes(p.subject);
   const aiDisabled = (reply: any) => reply.code(503).send({ ai_available: false, reason: 'ai_disabled' });
 
   // Citizen chat = multilingual PLATFORM GUIDE only. No issue/report reads, no tools:
@@ -242,6 +248,7 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
   app.post('/v1/ai/chat', { bodyLimit: 8 * 1024 }, async (req, reply) => {
     const principal = await auth(req);
     if (aiOff) return aiDisabled(reply); // hard kill-switch: no user content is processed while disabled
+    if (aiScopeDeny(principal)) return reply.code(403).send({ ai_available: false, reason: 'ai_not_allowed' }); // scoped mode: unlisted principal, deny-by-default
     const b = (req.body ?? {}) as { message?: string; issue_id?: string };
     if (typeof b.message !== 'string' || b.message.trim().length === 0 || b.message.length > 1000) {
       throw new HttpError(400, 'message (1..1000 chars) is required.', 'bad_request');
@@ -264,6 +271,7 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
   app.post('/v1/ai/email-draft', { bodyLimit: 8 * 1024 }, async (req, reply) => {
     const principal = await auth(req);
     if (aiOff) return aiDisabled(reply); // hard kill-switch: no user content is processed while disabled
+    if (aiScopeDeny(principal)) return reply.code(403).send({ ai_available: false, reason: 'ai_not_allowed' }); // scoped mode: unlisted principal, deny-by-default
     const b = (req.body ?? {}) as { hazard?: string; note?: string; lat?: number; lon?: number; ward?: string; complaint_no?: string };
     const hazardOk = typeof b.hazard === 'string' && (HAZARDS as readonly string[]).includes(b.hazard);
     const latOk = typeof b.lat === 'number' && Number.isFinite(b.lat) && b.lat >= -90 && b.lat <= 90;
@@ -285,6 +293,7 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
   app.post('/v1/ai/image-check', { bodyLimit: 6 * 1024 * 1024 }, async (req, reply) => {
     const principal = await auth(req);
     if (aiOff) return aiDisabled(reply); // hard kill-switch: no user content is processed while disabled
+    if (aiScopeDeny(principal)) return reply.code(403).send({ ai_available: false, reason: 'ai_not_allowed' }); // scoped mode: unlisted principal, deny-by-default
     const b = (req.body ?? {}) as { image_base64?: string; hazard?: string; note?: string };
     if (typeof b.image_base64 !== 'string' || b.image_base64.length < 100 || b.image_base64.length > 5_800_000 || !/^[A-Za-z0-9+/=\r\n]+$/.test(b.image_base64)) {
       throw new HttpError(400, 'image_base64 (100..5.8M base64 chars) is required.', 'bad_request');
@@ -305,6 +314,7 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
   app.post('/v1/ai/contractor-brief', { bodyLimit: 8 * 1024 }, async (req, reply) => {
     const principal = await auth(req);
     if (aiOff) return aiDisabled(reply); // hard kill-switch: no user content is processed while disabled
+    if (aiScopeDeny(principal)) return reply.code(403).send({ ai_available: false, reason: 'ai_not_allowed' }); // scoped mode: unlisted principal, deny-by-default
     const b = (req.body ?? {}) as { contractor_name?: string };
     if (typeof b.contractor_name !== 'string' || b.contractor_name.trim().length < 2 || b.contractor_name.length > 120) {
       throw new HttpError(400, 'contractor_name (2..120 chars) is required.', 'bad_request');

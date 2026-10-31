@@ -7,7 +7,10 @@ import http.server, urllib.request, urllib.error, socket, os, sys
 TOKEN_FILE = os.path.expanduser("~/.nagartrace/laptop-ai-token")
 UPSTREAM = "http://127.0.0.1:11434"
 ALLOWED = {("/api/chat", "POST"), ("/api/tags", "GET"), ("/api/show", "POST")}
-MAX_BODY = 25 * 1024 * 1024  # 25 MB: photos for the vision check, no unbounded reads
+# Per-route body caps (endpoint narrowing): only /api/chat ever carries payloads (photos for the
+# vision check); the model-info probes are tiny. A body on the wrong route is refused outright.
+MAX_BODY_BY_ROUTE = {"/api/chat": 25 * 1024 * 1024, "/api/show": 4 * 1024, "/api/tags": 0}
+MAX_BODY = 25 * 1024 * 1024  # absolute ceiling, mirrors MAX_BODY_BY_ROUTE
 UPSTREAM_TIMEOUT = 300  # seconds; local inference can be slow, never infinite
 CLIENT_TIMEOUT = 60     # seconds; a stalled client cannot hold a thread forever
 
@@ -62,7 +65,8 @@ class H(http.server.BaseHTTPRequestHandler):
                     length = int(raw)
                 except ValueError:
                     return self._reject(400, "bad_content_length")
-                if length < 0 or length > MAX_BODY:
+                cap = MAX_BODY_BY_ROUTE.get(self.path, 0)
+                if length < 0 or length > min(cap, MAX_BODY):
                     return self._reject(413, "body_size_out_of_bounds")
                 body = self.rfile.read(length) if length else None
             req = urllib.request.Request(UPSTREAM + self.path, data=body, method=self.command,
