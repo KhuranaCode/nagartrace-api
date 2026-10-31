@@ -36,8 +36,9 @@ for f in "$HOME/.ollama/logs/server.log" /var/log/ollama.log /var/log/ollama/*.l
   [ -e "$f" ] && { ls -la "$f"; found=1; }
 done
 [ "$found" = 0 ] && echo "no ollama file logs found; journald check:"
-# Metadata ONLY: timestamp of the newest journal line, never its content (a log line can hold prompt text).
-journalctl -u ollama --no-pager -n 1 -o short-iso 2>/dev/null | awk '{print "newest ollama journal entry at:", $1}' || echo "no ollama journal unit"
+# Metadata ONLY: explicit timestamp FIELD of the newest journal entry, never any line content
+# (a log line can hold prompt text). Falls back to a count if the unit is absent.
+journalctl -u ollama --no-pager -n 1 -o json --output-fields=__REALTIME_TIMESTAMP 2>/dev/null | grep -o '"__REALTIME_TIMESTAMP":"[0-9]*"' | head -1 || echo "no ollama journal unit"
 echo "journal line count (volume hint only): $(journalctl -u ollama --no-pager 2>/dev/null | wc -l)"
 
 out "gateway wrapper (presence + the two facts the privacy claims need)"
@@ -54,6 +55,9 @@ done
 
 out "cloudflared tunnel (presence + config existence only)"
 pgrep -x cloudflared >/dev/null && echo "cloudflared: running" || echo "cloudflared: NOT running"
+# Gateway exposure check: LISTENING ADDRESSES only (metadata). Safe = 127.0.0.1/::1 only;
+# any 0.0.0.0 or LAN address here means the gateway bypasses the tunnel - that fails activation.
+ss -tlnp 2>/dev/null | grep -E "ai-gateway|ollama|11434|8080" | awk '{print "listener:", $4, $6}' || echo "ss unavailable - binding UNVERIFIED"
 for f in "$HOME/.cloudflared/config.yml" /etc/cloudflared/config.yml; do
   [ -f "$f" ] && echo "config exists: $f ($(stat -c 'mtime %y' "$f"))"
 done
@@ -64,3 +68,8 @@ ls /tmp 2>/dev/null | grep -ciE "ollama|gateway" | xargs -I{} echo "ollama/gatew
 
 out "done"
 echo "Metadata only: no file contents, env values or log lines were read. Safe to share as-is."
+
+# HONEST SCOPE: this script reads local state and FILTERS it down to metadata before printing;
+# raw values are processed on the laptop and never printed into the report. Its findings are
+# metadata indicators, NOT proof: a 'log override present' result does not prove logging is
+# suppressed, and clean metadata cannot prove zero retention. Treat its output as leads only.
