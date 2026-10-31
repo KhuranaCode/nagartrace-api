@@ -234,6 +234,7 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
     if (await aiGate(reply, principal, 'photo_advisory')) return; // kill-switch + scope + per-feature consent, all deny-by-default
     // Validate BEFORE taking a budget slot: a rejected request must never consume one.
     const b = (req.body ?? {}) as { hazard?: string; note?: string; lat?: number; lon?: number; ward?: string };
+    rejectUnknownKeys(b as Record<string, unknown>, ['hazard', 'note', 'lat', 'lon', 'ward']);
     const hazardOk = typeof b.hazard === 'string' && (HAZARDS as readonly string[]).includes(b.hazard);
     const latOk = typeof b.lat === 'number' && Number.isFinite(b.lat) && b.lat >= -90 && b.lat <= 90;
     const lonOk = typeof b.lon === 'number' && Number.isFinite(b.lon) && b.lon >= -180 && b.lon <= 180;
@@ -264,10 +265,13 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
     if (e instanceof LaptopAiError) return reply.code(503).send({ ai_available: false, reason: e.reason });
     throw e;
   };
-  // HARD KILL-SWITCH (enforced contract: no real user text/photos/reports/chats may reach
-  // the laptop gateway, with or without consent). Default aiAccessMode 'off' refuses every AI route
-  // even when LAPTOP_AI_URL is configured, so a mis-deployed env cannot carry user data.
-  // 'test' is for local synthetic testing only and must never be set on production.
+  // AI access contract: aiAccessMode decides who, if anyone, may have input processed.
+  // Default 'off' refuses every AI route even when LAPTOP_AI_URL is configured, so a
+  // mis-deployed env cannot carry user data. 'test' is the local synthetic harness and must
+  // never be set on production. 'scoped' allows exact listed subjects only. 'consented'
+  // allows a signed-in user only with an active, current-notice, per-feature consent row
+  // (db 016), checked at entry AND immediately before dispatch. In every mode only the
+  // whitelisted per-route input fields are forwarded; unknown body keys are rejected.
   // AI activation gate. 'off': nothing processed. 'test': synthetic-harness mode (never in prod).
   // 'scoped': real-input mode restricted to exact listed subjects - deny-by-default for everyone
   // else (403 ai_not_allowed, distinct from the kill-switch's ai_disabled). The allowlist is the
@@ -278,7 +282,7 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
   // an active, current-notice consent row for THAT feature. Missing, revoked or stale-notice
   // consent denies with 403 consent_required - no data flows before opt-in, no cross-feature bleed.
   const AI_NOTICE_VERSION = 'v1';
-  const AI_NOTICE_TEXT = 'NagarTrace AI features run on the operator\'s own computer, not on the NagarTrace server. Only the exact input of the feature you use is sent there: the guide receives your question; the email draft and report check receive the report details you enter (hazard, note, location coordinates, ward, complaint number); the photo check receives the photo itself plus its hazard and note; the contractor brief receives the contractor name you ask about, matched against public records. Nothing else is sent - no account data, no other reports, no IDs. The connection is encrypted, but this processing is NOT end-to-end encrypted, and AI is unavailable when that computer is off. Answers are advisory and never change your report by themselves. You can revoke consent per feature at any time; revocation stops all new processing immediately, but a request already sent at that moment cannot be recalled.';
+  const AI_NOTICE_TEXT = 'NagarTrace AI features run on the operator\'s own computer, not on the NagarTrace server. Only the exact input of the feature you use is sent there. The guide receives your question. The report check receives the report details you enter (hazard, note, location coordinates, ward). The photo check receives the photo itself plus its hazard and note. The email draft receives the report details you enter (hazard, note, location coordinates, ward) plus the complaint reference only if you choose to include it. The contractor brief looks up the contractor name you enter in a public award registry and sends the matching public records (project name, state, length, award date, awarded cost, executing agency, mode, stage, type, source label). No account identifiers or internal IDs are sent, and no reports other than the fields you just typed. The connection is encrypted, but this processing is NOT end-to-end encrypted, and AI is unavailable when that computer is off. Answers are advisory and never change your report by themselves. You can revoke consent per feature at any time; revocation stops new processing, but a request already sent at that moment cannot be recalled.';
   const AI_FEATURES = ['guide_chat', 'email_draft', 'photo_advisory', 'contractor_finder'] as const;
   type AiFeature = typeof AI_FEATURES[number];
   const aiConsentDeny = async (p: { userId: string }, feature: AiFeature) => {
@@ -302,6 +306,11 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
     }
     return false;
   };
+  // Strict bodies: unknown keys are REJECTED, not ignored - the wire can only ever carry the
+  // fields each route whitelists, and a typo or an attempted extra field must not pass silently.
+  const rejectUnknownKeys = (body: Record<string, unknown>, allowed: readonly string[]) => {
+    for (const k of Object.keys(body)) if (!allowed.includes(k)) throw new HttpError(400, `unknown field: ${k}`, 'bad_request');
+  };
   const aiDisabled = (reply: any) => reply.code(503).send({ ai_available: false, reason: 'ai_disabled' });
 
   // Citizen chat = multilingual PLATFORM GUIDE only. No issue/report reads, no tools:
@@ -310,6 +319,7 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
     const principal = await auth(req);
     if (await aiGate(reply, principal, 'guide_chat')) return; // kill-switch + scope + per-feature consent, all deny-by-default
     const b = (req.body ?? {}) as { message?: string; issue_id?: string };
+    rejectUnknownKeys(b as Record<string, unknown>, ['message', 'issue_id']);
     if (typeof b.message !== 'string' || b.message.trim().length === 0 || b.message.length > 1000) {
       throw new HttpError(400, 'message (1..1000 chars) is required.', 'bad_request');
     }
@@ -333,6 +343,7 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
     const principal = await auth(req);
     if (await aiGate(reply, principal, 'email_draft')) return; // kill-switch + scope + per-feature consent, all deny-by-default
     const b = (req.body ?? {}) as { hazard?: string; note?: string; lat?: number; lon?: number; ward?: string; complaint_no?: string };
+    rejectUnknownKeys(b as Record<string, unknown>, ['hazard', 'note', 'lat', 'lon', 'ward', 'complaint_no']);
     const hazardOk = typeof b.hazard === 'string' && (HAZARDS as readonly string[]).includes(b.hazard);
     const latOk = typeof b.lat === 'number' && Number.isFinite(b.lat) && b.lat >= -90 && b.lat <= 90;
     const lonOk = typeof b.lon === 'number' && Number.isFinite(b.lon) && b.lon >= -180 && b.lon <= 180;
@@ -355,6 +366,7 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
     const principal = await auth(req);
     if (await aiGate(reply, principal, 'photo_advisory')) return; // kill-switch + scope + per-feature consent, all deny-by-default
     const b = (req.body ?? {}) as { image_base64?: string; hazard?: string; note?: string };
+    rejectUnknownKeys(b as Record<string, unknown>, ['image_base64', 'hazard', 'note']);
     if (typeof b.image_base64 !== 'string' || b.image_base64.length < 100 || b.image_base64.length > 5_800_000 || !/^[A-Za-z0-9+/=\r\n]+$/.test(b.image_base64)) {
       throw new HttpError(400, 'image_base64 (100..5.8M base64 chars) is required.', 'bad_request');
     }
@@ -376,6 +388,7 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
     const principal = await auth(req);
     if (await aiGate(reply, principal, 'contractor_finder')) return; // kill-switch + scope + per-feature consent, all deny-by-default
     const b = (req.body ?? {}) as { contractor_name?: string };
+    rejectUnknownKeys(b as Record<string, unknown>, ['contractor_name']);
     if (typeof b.contractor_name !== 'string' || b.contractor_name.trim().length < 2 || b.contractor_name.length > 120) {
       throw new HttpError(400, 'contractor_name (2..120 chars) is required.', 'bad_request');
     }

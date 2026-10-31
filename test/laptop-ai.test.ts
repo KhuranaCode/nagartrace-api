@@ -417,3 +417,60 @@ test('revoke mid-flight: dispatched request completes honestly; every NEW dispat
     } finally { await w.close(); }
   } finally { globalThis.fetch = realFetch; }
 });
+
+test('strict bodies: unknown fields are REJECTED on every AI route (not silently ignored)', async () => {
+  const w = await newWorld({ aiAccessMode: 'test' });
+  try {
+    const c = client(w, await userToken('strict-u'));
+    for (const [path, body] of [
+      ['/v1/ai/chat', { message: 'hi', user_id: 'x' }],
+      ['/v1/ai/email-draft', { hazard: 'pothole', lat: 1, lon: 2, account: 'x' }],
+      ['/v1/ai/report-check', { hazard: 'pothole', lat: 1, lon: 2, issue_id: 'x' }],
+      ['/v1/ai/image-check', { image_base64: 'A'.repeat(200), issue_id: 'x' }],
+      ['/v1/ai/contractor-brief', { contractor_name: 'Acme', complaint_id: 'x' }],
+    ] as const) {
+      const r = await c.post(path, body);
+      assert.equal(r.status, 400, path);
+      assert.match(r.json.message, /unknown field/);
+    }
+    // chat's recognized-but-rejected issue_id still yields the guide-scope error, not unknown-field:
+    const g = await c.post('/v1/ai/chat', { message: 'hi', issue_id: 'x' });
+    assert.equal(g.status, 400); assert.match(g.json.message, /does not read issue data/);
+  } finally { await w.close(); }
+});
+
+test('revoke DURING retrieval: pending request is denied at the pre-dispatch re-check and never fetches the gateway', async () => {
+  const realFetch = globalThis.fetch;
+  const received: any[] = [];
+  globalThis.fetch = (async () => { received.push(1); return new Response('{}', { status: 200 }); }) as any;
+  try {
+    const w = await newWorld({ aiAccessMode: 'consented', laptopAiUrl: 'https://gw.example', laptopAiToken: 't', laptopAiModel: 'qwen3.5:2b' });
+    try {
+      await w.adminDb.query(`INSERT INTO nhai_award_records (source_url, source_label, page, sr, project_name, nh_from_name, contractor_name, state, loa_date, awarded_cost_cr)
+        VALUES ('https://nhai.gov.in/test.pdf', 'test', 1, 1, 'test project', ARRAY['km 1']::text[], 'Acme Infra', 'Punjab', '2024-12-27', 10.5)`);
+      const u = client(w, await userToken('race2-u'));
+      assert.equal((await u.post('/v1/ai/consents', { feature: 'contractor_finder', notice_version: 'v1' })).status, 200);
+      const locker = await w.adminDb.connect();
+      try {
+        await locker.query('BEGIN');
+        await locker.query('LOCK TABLE nhai_award_records IN ACCESS EXCLUSIVE MODE'); // app SELECT now waits
+        const pending = u.post('/v1/ai/contractor-brief', { contractor_name: 'Acme' });
+        // Wait until the app's retrieval SELECT is actually blocked on the lock:
+        let blocked = false;
+        for (let i = 0; i < 400 && !blocked; i++) {
+          await new Promise((r) => setTimeout(r, 5));
+          const q = await w.adminDb.query(`SELECT count(*)::int AS n FROM pg_stat_activity WHERE wait_event_type='Lock' AND query ILIKE '%nhai_award_records%' AND state='active'`);
+          blocked = q.rows[0].n > 0;
+        }
+        assert.ok(blocked, 'app retrieval never blocked on the lock - test interleaving not established');
+        // Revoke while the request is pending in retrieval (ai_consents is a different table, unaffected):
+        assert.equal((await u.post('/v1/ai/consents/revoke', { feature: 'contractor_finder' })).status, 200);
+        await locker.query('COMMIT'); // release: retrieval proceeds, pre-dispatch re-check must deny
+        const r = await pending;
+        assert.equal(r.status, 403);
+        assert.equal(r.json.reason, 'consent_required');
+        assert.equal(received.length, 0, 'gateway fetched after revoke');
+      } finally { locker.release(); }
+    } finally { await w.close(); }
+  } finally { globalThis.fetch = realFetch; }
+});
