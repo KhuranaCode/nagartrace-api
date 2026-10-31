@@ -208,6 +208,9 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
 
   app.post('/v1/ai/consents', async (req) => {
     const p = await auth(req);
+    // Consent only exists where the deployment asks for it. A grant recorded while AI is
+    // off/test/scoped would silently arm the feature if the mode later flipped to consented.
+    if (cfg.aiAccessMode !== 'consented') throw new HttpError(409, 'AI consent is not active in this deployment.', 'consent_inactive');
     const b = parse(z.object({ feature: z.enum(AI_FEATURES), notice_version: z.string().max(20) }).strict(), req.body);
     // Stale or wrong notice version cannot grant: the user must have seen the CURRENT notice.
     if (b.notice_version !== AI_NOTICE_VERSION) throw new HttpError(409, 'Consent notice is outdated - read the current notice and confirm again.', 'stale_notice');
@@ -223,15 +226,16 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
     const p = await auth(req);
     const b = parse(z.object({ feature: z.enum(AI_FEATURES) }).strict(), req.body);
     await tx(async (c) => {
-      await c.query('UPDATE ai_consents SET revoked_at=now() WHERE user_id=$1 AND feature=$2 AND revoked_at IS NULL', [p.userId, b.feature]);
-      await c.query('INSERT INTO ai_consent_events (user_id, feature, action, notice_version) VALUES ($1,$2,$3,$4)', [p.userId, b.feature, 'revoked', AI_NOTICE_VERSION]);
+      const u = await c.query('UPDATE ai_consents SET revoked_at=now() WHERE user_id=$1 AND feature=$2 AND revoked_at IS NULL', [p.userId, b.feature]);
+      // Audit a revoke only when it actually revoked something - no-op revokes are not events.
+      if ((u.rowCount ?? 0) > 0) await c.query('INSERT INTO ai_consent_events (user_id, feature, action, notice_version) VALUES ($1,$2,$3,$4)', [p.userId, b.feature, 'revoked', AI_NOTICE_VERSION]);
     });
     return { ok: true, feature: b.feature, revoked: true };
   });
 
   app.post('/v1/ai/report-check', { bodyLimit: 8 * 1024 }, async (req, reply) => {
     const principal = await auth(req);
-    if (await aiGate(reply, principal, 'photo_advisory')) return; // kill-switch + scope + per-feature consent, all deny-by-default
+    if (await aiGate(reply, principal, 'report_check')) return; // kill-switch + scope + per-feature consent, all deny-by-default
     // Validate BEFORE taking a budget slot: a rejected request must never consume one.
     const b = (req.body ?? {}) as { hazard?: string; note?: string; lat?: number; lon?: number; ward?: string };
     rejectUnknownKeys(b as Record<string, unknown>, ['hazard', 'note', 'lat', 'lon', 'ward']);
@@ -246,7 +250,7 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
     const budget = admitReportCheck(principal.userId);
     if (!budget.ok) return reply.code(503).send({ ai_available: false, reason: budget.reason });
     try {
-      if (await aiDispatchDeny(reply, principal, 'photo_advisory')) return; // re-check just before dispatch
+      if (await aiDispatchDeny(reply, principal, 'report_check')) return; // re-check just before dispatch
       const advisory = await reportCheck({ url: cfg.laptopAiUrl, token: cfg.laptopAiToken, model: cfg.laptopAiModel, timeoutMs: cfg.laptopAiTimeoutMs },
         { hazard: b.hazard!, note: b.note, lat: b.lat!, lon: b.lon!, ward: b.ward });
       return { ai_available: true, advisory };
@@ -283,7 +287,7 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
   // consent denies with 403 consent_required - no data flows before opt-in, no cross-feature bleed.
   const AI_NOTICE_VERSION = 'v1';
   const AI_NOTICE_TEXT = 'NagarTrace AI features run on the operator\'s own computer, not on the NagarTrace server. Only the exact input of the feature you use is sent there. The guide receives your question. The report check receives the report details you enter (hazard, note, location coordinates, ward). The photo check receives the photo itself plus its hazard and note. The email draft receives the report details you enter (hazard, note, location coordinates, ward) plus the complaint reference only if you choose to include it. The contractor brief looks up the contractor name you enter in a public award registry and sends the matching public records (project name, state, length, award date, awarded cost, executing agency, mode, stage, type, source label). No account identifiers or internal IDs are sent, and no reports other than the fields you just typed. The connection is encrypted, but this processing is NOT end-to-end encrypted, and AI is unavailable when that computer is off. Answers are advisory and never change your report by themselves. You can revoke consent per feature at any time; revocation stops new processing, but a request already sent at that moment cannot be recalled.';
-  const AI_FEATURES = ['guide_chat', 'email_draft', 'photo_advisory', 'contractor_finder'] as const;
+  const AI_FEATURES = ['guide_chat', 'email_draft', 'report_check', 'photo_advisory', 'contractor_finder'] as const;
   type AiFeature = typeof AI_FEATURES[number];
   const aiConsentDeny = async (p: { userId: string }, feature: AiFeature) => {
     if (cfg.aiAccessMode !== 'consented') return false;

@@ -328,6 +328,15 @@ test('scoped mode: deny-by-default - unlisted principal gets 403 ai_not_allowed,
   } finally { await w.close(); }
 });
 
+test('consent grant is refused outside consented mode (no silent arming on a later mode flip)', async () => {
+  const w = await newWorld({ aiAccessMode: 'scoped', aiAllowedSubjects: ['owner-real-1'] });
+  try {
+    const u = client(w, await userToken('owner-real-1'));
+    const r = await u.post('/v1/ai/consents', { feature: 'guide_chat', notice_version: 'v1' });
+    assert.equal(r.status, 409); assert.equal(r.json.error ?? r.json.code ?? r.json.reason, 'consent_inactive');
+  } finally { await w.close(); }
+});
+
 test('scoped mode with an empty allowlist cannot boot (fail closed, never silently allows)', async () => {
   const origMode = process.env.AI_ACCESS_MODE; const origSubs = process.env.AI_ALLOWED_SUBJECTS;
   process.env.AI_ACCESS_MODE = 'scoped'; delete process.env.AI_ALLOWED_SUBJECTS;
@@ -348,7 +357,7 @@ test('consented mode: per-feature consent required, grant unlocks ONLY that feat
     // Notice is public and versioned:
     const n = await u.get('/v1/ai/consent-notice');
     assert.equal(n.status, 200); assert.equal(n.json.version, 'v1'); assert.ok(n.json.text.includes('NOT end-to-end encrypted'));
-    assert.deepEqual(n.json.features, ['guide_chat', 'email_draft', 'photo_advisory', 'contractor_finder']);
+    assert.deepEqual(n.json.features, ['guide_chat', 'email_draft', 'report_check', 'photo_advisory', 'contractor_finder']);
     // No consent rows: every feature denies with consent_required BEFORE any input is processed:
     for (const [path, body] of [
       ['/v1/ai/chat', { message: 'how do I report?' }],
@@ -367,16 +376,28 @@ test('consented mode: per-feature consent required, grant unlocks ONLY that feat
     const chat = await u.post('/v1/ai/chat', { message: 'how do I report?' });
     assert.equal(chat.status, 503); assert.equal(chat.json.reason, 'not_configured'); // passed consent, hit honest offline
     assert.equal((await u.post('/v1/ai/email-draft', { hazard: 'pothole', lat: 30.7, lon: 76.7 })).status, 403); // email still denied
+    // Typed report details and photo BYTES are separate consents: one never unlocks the other.
+    assert.equal((await u.post('/v1/ai/consents', { feature: 'report_check', notice_version: 'v1' })).status, 200);
+    assert.equal((await u.post('/v1/ai/report-check', { hazard: 'pothole', lat: 30.7, lon: 76.7 })).status, 503); // passed consent, honest offline
+    assert.equal((await u.post('/v1/ai/image-check', { image_base64: 'A'.repeat(200) })).status, 403, 'report_check consent must NOT unlock photo bytes');
+    assert.equal((await u.post('/v1/ai/consents/revoke', { feature: 'report_check' })).status, 200);
+    assert.equal((await u.post('/v1/ai/consents', { feature: 'photo_advisory', notice_version: 'v1' })).status, 200);
+    assert.equal((await u.post('/v1/ai/report-check', { hazard: 'pothole', lat: 30.7, lon: 76.7 })).status, 403, 'photo_advisory consent must NOT unlock typed report check');
+    assert.equal((await u.post('/v1/ai/consents/revoke', { feature: 'photo_advisory' })).status, 200);
+    // A no-op revoke writes NO audit event (noise guard):
+    assert.equal((await u.post('/v1/ai/consents/revoke', { feature: 'contractor_finder' })).status, 200);
     // Another user gains nothing from u's grant:
     assert.equal((await other.post('/v1/ai/chat', { message: 'hi' })).status, 403);
     // Consent listing shows the grant:
     const list = await u.get('/v1/ai/consents');
-    assert.equal(list.json.consents.length, 1); assert.equal(list.json.consents[0].feature, 'guide_chat'); assert.equal(list.json.consents[0].revoked_at, null);
+    const active = list.json.consents.filter((c: any) => c.revoked_at === null);
+    assert.deepEqual(active.map((c: any) => c.feature), ['guide_chat']); // the two granularity grants above were revoked again
+    assert.equal(list.json.consents.length, 3); // revoked rows stay visible to the user - history, not hidden
     // Revoke re-denies immediately, and the audit trail recorded grant + revoke:
     assert.equal((await u.post('/v1/ai/consents/revoke', { feature: 'guide_chat' })).status, 200);
     assert.equal((await u.post('/v1/ai/chat', { message: 'hi' })).status, 403);
     const evs = (await w.adminDb.query('SELECT action FROM ai_consent_events ORDER BY id')).rows.map((r) => r.action);
-    assert.deepEqual(evs, ['granted', 'revoked']);
+    assert.deepEqual(evs, ['granted', 'granted', 'revoked', 'granted', 'revoked', 'revoked']); // no event for the no-op contractor_finder revoke
   } finally { await w.close(); }
 });
 
@@ -414,6 +435,69 @@ test('revoke mid-flight: dispatched request completes honestly; every NEW dispat
       assert.equal(next.status, 403);
       assert.equal(next.json.reason, 'consent_required');
       assert.equal(received.length, 1, 'gateway saw a request made after revoke');
+    } finally { await w.close(); }
+  } finally { globalThis.fetch = realFetch; }
+});
+
+test('exact wire payloads per feature: only the whitelisted input travels, complaint ref only when provided, image exactly bytes+hazard+note, contractor rows only', async () => {
+  const realFetch = globalThis.fetch;
+  const received: any[] = [];
+  const advisory = JSON.stringify({ summary: 's', severity_hint: 'medium', suggested_hazard: null, missing_details: [] });
+  globalThis.fetch = (async (_url: any, init: any) => {
+    if (String(_url).includes('/api/show') || String(_url).includes('/api/tags') || !init?.body) {
+      return new Response(JSON.stringify({ capabilities: ['completion', 'vision'] }), { status: 200 }); // model capability prechecks, not inference
+    }
+    const body = JSON.parse(init.body);
+    received.push(body);
+    const sys = body.messages[0].content as string;
+    let out: string;
+    if (sys.includes('grievance-drafting')) {
+      const u = JSON.parse(body.messages[1].content);
+      out = JSON.stringify({ subject: 'Pothole report', body: `Please fix. ${u.location_line}` });
+    } else if (sys.includes('contractor-records summarizer')) {
+      const u = JSON.parse(body.messages[1].content);
+      out = JSON.stringify({ summary: 'One award found, not proof of fault.', record_count: u.records.length, key_facts: ['test project'] });
+    } else {
+      out = advisory;
+    }
+    return new Response(JSON.stringify({ message: { content: out } }), { status: 200 });
+  }) as any;
+  try {
+    const w = await newWorld({ aiAccessMode: 'consented', laptopAiUrl: 'https://gw.example', laptopAiToken: 't', laptopAiModel: 'qwen3.5:2b' });
+    try {
+      await w.adminDb.query(`INSERT INTO nhai_award_records (source_url, source_label, page, sr, project_name, nh_from_name, contractor_name, state, loa_date, awarded_cost_cr)
+        VALUES ('https://nhai.gov.in/test.pdf', 'test', 1, 1, 'test project', ARRAY['km 1']::text[], 'Acme Infra', 'Punjab', '2024-12-27', 10.5)`);
+      const u = client(w, await userToken('wire-u'));
+      for (const f of ['email_draft', 'report_check', 'photo_advisory', 'contractor_finder'] as const) {
+        assert.equal((await u.post('/v1/ai/consents', { feature: f, notice_version: 'v1' })).status, 200);
+      }
+      // email-draft: complaint ref ABSENT unless the caller explicitly sends it
+      const ed = await u.post('/v1/ai/email-draft', { hazard: 'pothole', lat: 30.7, lon: 76.7, ward: 'Ward 12' });
+      assert.equal(ed.status, 200);
+      const emailWire = JSON.parse(received[received.length - 1].messages[1].content);
+      assert.deepEqual(Object.keys(emailWire).sort(), ['complaint_no', 'hazard', 'location_line', 'note', 'ward']);
+      assert.equal(emailWire.complaint_no, null, 'no complaint ref on the wire unless the user chose it');
+      assert.ok(!emailWire.location_line.includes('Ref:'));
+      assert.equal((await u.post('/v1/ai/email-draft', { hazard: 'pothole', lat: 30.7, lon: 76.7, complaint_no: 'NT-1' })).status, 200);
+      const emailWire2 = JSON.parse(received[received.length - 1].messages[1].content);
+      assert.equal(emailWire2.complaint_no, 'NT-1');
+      assert.ok(emailWire2.location_line.includes('(Ref: NT-1)'));
+      // report-check: typed details only
+      assert.equal((await u.post('/v1/ai/report-check', { hazard: 'pothole', lat: 30.7, lon: 76.7, note: 'deep' })).status, 200);
+      const rcWire = JSON.parse(received[received.length - 1].messages[1].content);
+      assert.deepEqual(Object.keys(rcWire).sort(), ['hazard', 'lat', 'lon', 'note', 'ward']);
+      // image-check: exactly the image bytes + hazard + note, nothing else
+      assert.equal((await u.post('/v1/ai/image-check', { image_base64: 'QUJD'.repeat(60), hazard: 'pothole', note: 'n' })).status, 200);
+      const imgMsg = received[received.length - 1].messages[1];
+      assert.deepEqual(imgMsg.images, ['QUJD'.repeat(60)]);
+      assert.deepEqual(JSON.parse(imgMsg.content), { hazard: 'pothole', note: 'n' });
+      // contractor-brief: registry rows only - no user identifiers anywhere in the payload
+      assert.equal((await u.post('/v1/ai/contractor-brief', { contractor_name: 'Acme' })).status, 200);
+      const cbWire = JSON.parse(received[received.length - 1].messages[1].content);
+      assert.deepEqual(Object.keys(cbWire), ['records']);
+      assert.equal(cbWire.records.length, 1);
+      const raw = JSON.stringify(received[received.length - 1]);
+      assert.ok(!raw.includes('wire-u'), 'no user identifier leaks into the contractor payload');
     } finally { await w.close(); }
   } finally { globalThis.fetch = realFetch; }
 });

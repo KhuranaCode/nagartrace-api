@@ -4,7 +4,7 @@
 -- MUST check: row exists, revoked_at IS NULL, notice_version = the server's current notice.
 CREATE TABLE ai_consents (
   user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  feature text NOT NULL CHECK (feature IN ('guide_chat', 'email_draft', 'photo_advisory', 'contractor_finder')),
+  feature text NOT NULL CHECK (feature IN ('guide_chat', 'email_draft', 'report_check', 'photo_advisory', 'contractor_finder')),
   notice_version text NOT NULL,
   granted_at timestamptz NOT NULL DEFAULT now(),
   revoked_at timestamptz,
