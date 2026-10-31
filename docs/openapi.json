@@ -29,6 +29,114 @@
     }
    }
   },
+  "/v1/ai/status": {
+   "get": {
+    "summary": "AI advisory availability; always 200 with {configured,available,reason?} for signed-in users",
+    "security": [
+     {
+      "bearer": []
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     },
+     "4XX": {
+      "description": "{error,message}; hidden records return 404"
+     }
+    }
+   }
+  },
+  "/v1/ai/report-check": {
+   "post": {
+    "summary": "AI advisory on a draft report; 503 {ai_available:false,reason} when the laptop AI is offline - never a fabricated suggestion",
+    "security": [
+     {
+      "bearer": []
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     },
+     "4XX": {
+      "description": "{error,message}; hidden records return 404"
+     }
+    }
+   }
+  },
+  "/v1/ai/chat": {
+   "post": {
+    "summary": "Citizen chat: multilingual platform guide; no issue/report/account data; 503 {ai_available:false,reason} when AI is offline or disabled",
+    "security": [
+     {
+      "bearer": []
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     },
+     "4XX": {
+      "description": "{error,message}; hidden records return 404"
+     }
+    }
+   }
+  },
+  "/v1/ai/email-draft": {
+   "post": {
+    "summary": "Grievance email DRAFT for the citizen to review and send themselves; this service never sends mail; 503 when offline",
+    "security": [
+     {
+      "bearer": []
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     },
+     "4XX": {
+      "description": "{error,message}; hidden records return 404"
+     }
+    }
+   }
+  },
+  "/v1/ai/image-check": {
+   "post": {
+    "summary": "Staged-photo AI check; requires a vision-capable configured model, else honest model_not_vision; 503 when offline",
+    "security": [
+     {
+      "bearer": []
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     },
+     "4XX": {
+      "description": "{error,message}; hidden records return 404"
+     }
+    }
+   }
+  },
+  "/v1/ai/contractor-brief": {
+   "post": {
+    "summary": "Contractor brief grounded ONLY in nhai_award_records rows retrieved by the backend; zero rows = found:false with no model call; 503 when offline",
+    "security": [
+     {
+      "bearer": []
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     },
+     "4XX": {
+      "description": "{error,message}; hidden records return 404"
+     }
+    }
+   }
+  },
   "/v1/me": {
    "get": {
     "summary": "Current user (creates citizen on first call)",

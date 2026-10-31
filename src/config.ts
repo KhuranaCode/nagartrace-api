@@ -31,6 +31,16 @@ export type Config = {
   level2DelayHours: number;
   publicScorecards: boolean;
   photoRequired: boolean;
+  /** Authenticated bridge to the owner's own laptop inference (Qwen via Ollama). Unset = AI off, honestly reported. */
+  laptopAiUrl?: string;
+  laptopAiToken?: string;
+  laptopAiModel: string;
+  laptopAiTimeoutMs: number;
+  /** 'off' (default): every /v1/ai/* route refuses, even when LAPTOP_AI_URL is set - hard kill
+   *  so a mis-deployed env can never carry real user text/photos to the laptop gateway.
+   *  'test': routes enabled for LOCAL synthetic testing only; must never be set on the
+   *  production service. Any real-user AI processing needs a separate owner-approved route. */
+  aiAccessMode: 'off' | 'test';
   /** Product requirement: new reports must bind a staged photo. FALSE during the client rollout window; the deployment owner sets PHOTO_REQUIRED=true once the web client stages photos. Server-enforced when true - no bypass route. */
   rateLimitMax: number;
   /** Follow-up reminder pipeline routes + sweep job. Default OFF; the deployment owner flips FOLLOWUP_PIPELINE=true AFTER migration 011 is applied (coordinated). When off, the routes return 404 and clients show the static honest fallback. */
@@ -59,6 +69,9 @@ export function defaults(): Omit<Config, 'authIssuer' | 'authAudience' | 'databa
     level2DelayHours: 48, // ASSUMPTION
     publicScorecards: false, // PRD: legal review before publishing contractor performance
     photoRequired: false, // flipped by the deployment owner after the photo-staging client is live
+    laptopAiModel: 'qwen3.5:4b',
+    laptopAiTimeoutMs: 25000,
+    aiAccessMode: 'off',
     rateLimitMax: 120,
     followupPipeline: false, // flipped by the deployment owner after migration 011 is applied
   };
@@ -80,6 +93,10 @@ export function fromEnv(env = process.env): Config {
   // Hosted TEST deployments on synthetic data only: explicit opt-in to the provisional dev defaults. Never allowed with NODE_ENV=production.
   const devDefaults = env.POLICY_USE_DEV_DEFAULTS === 'synthetic-test-only';
   if (devDefaults && env.NODE_ENV === 'production') throw new Error('POLICY_USE_DEV_DEFAULTS cannot be used with NODE_ENV=production');
+  // Fail-closed at boot: the laptop gateway is a synthetic-test harness only. Even if someone
+  // sets AI_ACCESS_MODE=test on the production service, the process refuses to start.
+  if (env.NODE_ENV === 'production' && env.AI_ACCESS_MODE === 'test')
+    throw new Error('AI_ACCESS_MODE=test cannot be used with NODE_ENV=production');
   if (!devDefaults) for (const [envKey, key] of Object.entries(POLICY_KEYS)) {
     const n = Number(need(envKey));
     if (!Number.isFinite(n) || n < 0) throw new Error(`${envKey} must be a non-negative number`);
@@ -104,6 +121,11 @@ export function fromEnv(env = process.env): Config {
     trustProxy: env.TRUST_PROXY === 'true',
     publicScorecards: env.PUBLIC_SCORECARDS === 'true',
     photoRequired: env.PHOTO_REQUIRED === 'true',
+    laptopAiUrl: env.LAPTOP_AI_URL || undefined,
+    laptopAiToken: env.LAPTOP_AI_TOKEN || undefined,
+    aiAccessMode: env.AI_ACCESS_MODE === 'test' ? 'test' : 'off',
+    laptopAiModel: env.LAPTOP_AI_MODEL ?? 'qwen3.5:4b',
+    laptopAiTimeoutMs: Number(env.LAPTOP_AI_TIMEOUT_MS ?? 25000),
     followupPipeline: env.FOLLOWUP_PIPELINE === 'true',
     mainAdminSubject: env.MAIN_ADMIN_SUBJECT?.trim() || undefined,
   } as Config;

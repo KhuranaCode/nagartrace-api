@@ -4,12 +4,13 @@ import { z } from 'zod';
 import type pg from 'pg';
 import type { Config } from './config.ts';
 import { authenticate, HttpError, isMainAdmin, memberships, type KeyResolver, type Membership, type Principal } from './auth.ts';
+import { admitReportCheck, admitInference, laptopAiStatus, reportCheck, chat as aiChat, emailDraft as aiEmailDraft, imageCheck as aiImageCheck, contractorBrief as aiContractorBrief, LaptopAiError, type LaptopAiConfig } from './laptop-ai.ts';
 import { awardPoints, deadlineHours, lockIssue, recordEvent, routeIssue, runEscalations, severityOf, transition } from './domain.ts';
 import { registerStreakRoutes } from './streaks.ts';
 import { registerFollowupRoutes } from './followup.ts';
 import { normalizeImage } from './images.ts';
 import type { BlobStore } from './storage.ts';
-import { officialRecordsForPoint, nhaiAwardsBrowse } from './govrecords.ts';
+import { officialRecordsForPoint, nhaiAwardsBrowse, CANDIDATE_WARNING } from './govrecords.ts';
 
 export type Deps = { cfg: Config; db: pg.Pool; keys: KeyResolver; store: BlobStore; now?: () => Date };
 
@@ -187,6 +188,146 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
       [issueId, userId, s.storage_key, s.sha256, s.content_type, s.byte_size, s.width, s.height, s.claimed_geom]);
     return { evidence_id: ev.rows[0].id as string, location_ok: true };
   }
+
+  // ---------- laptop AI (owner-hosted, honest offline) ----------
+  app.get('/v1/ai/status', async (req) => {
+    await auth(req); // signed-in users only; no public inference probe
+    if (aiOff) return { ai_available: false, reason: 'ai_disabled' }; // no config details leak when disabled
+    return laptopAiStatus({ url: cfg.laptopAiUrl, token: cfg.laptopAiToken, model: cfg.laptopAiModel, timeoutMs: cfg.laptopAiTimeoutMs });
+  });
+
+  app.post('/v1/ai/report-check', { bodyLimit: 8 * 1024 }, async (req, reply) => {
+    const principal = await auth(req);
+    if (aiOff) return aiDisabled(reply); // hard kill-switch: no user content is processed while disabled
+    // Validate BEFORE taking a budget slot: a rejected request must never consume one.
+    const b = (req.body ?? {}) as { hazard?: string; note?: string; lat?: number; lon?: number; ward?: string };
+    const hazardOk = typeof b.hazard === 'string' && (HAZARDS as readonly string[]).includes(b.hazard);
+    const latOk = typeof b.lat === 'number' && Number.isFinite(b.lat) && b.lat >= -90 && b.lat <= 90;
+    const lonOk = typeof b.lon === 'number' && Number.isFinite(b.lon) && b.lon >= -180 && b.lon <= 180;
+    if (!hazardOk || !latOk || !lonOk) {
+      throw new HttpError(400, 'hazard (known type), lat (-90..90) and lon (-180..180) are required.', 'bad_request');
+    }
+    if (b.note !== undefined && (typeof b.note !== 'string' || b.note.length > 2000)) throw new HttpError(400, 'note too long.', 'bad_request');
+    if (b.ward !== undefined && (typeof b.ward !== 'string' || b.ward.length > 120)) throw new HttpError(400, 'ward too long.', 'bad_request');
+    const budget = admitReportCheck(principal.userId);
+    if (!budget.ok) return reply.code(503).send({ ai_available: false, reason: budget.reason });
+    try {
+      const advisory = await reportCheck({ url: cfg.laptopAiUrl, token: cfg.laptopAiToken, model: cfg.laptopAiModel, timeoutMs: cfg.laptopAiTimeoutMs },
+        { hazard: b.hazard!, note: b.note, lat: b.lat!, lon: b.lon!, ward: b.ward });
+      return { ai_available: true, advisory };
+    } catch (e) {
+      if (e instanceof LaptopAiError) {
+        return reply.code(503).send({ ai_available: false, reason: e.reason });
+      }
+      throw e;
+    } finally {
+      budget.done();
+    }
+  });
+
+  const aiCfg = (): LaptopAiConfig => ({ url: cfg.laptopAiUrl, token: cfg.laptopAiToken, model: cfg.laptopAiModel, timeoutMs: cfg.laptopAiTimeoutMs });
+  const aiUnavailable = (reply: any, e: unknown) => {
+    if (e instanceof LaptopAiError) return reply.code(503).send({ ai_available: false, reason: e.reason });
+    throw e;
+  };
+  // HARD KILL-SWITCH (enforced contract: no real user text/photos/reports/chats may reach
+  // the laptop gateway, with or without consent). Default aiAccessMode 'off' refuses every AI route
+  // even when LAPTOP_AI_URL is configured, so a mis-deployed env cannot carry user data.
+  // 'test' is for local synthetic testing only and must never be set on production.
+  const aiOff = cfg.aiAccessMode !== 'test';
+  const aiDisabled = (reply: any) => reply.code(503).send({ ai_available: false, reason: 'ai_disabled' });
+
+  // Citizen chat = multilingual PLATFORM GUIDE only. No issue/report reads, no tools:
+  // user text is the question, never a source of facts, and the model sees no account data.
+  app.post('/v1/ai/chat', { bodyLimit: 8 * 1024 }, async (req, reply) => {
+    const principal = await auth(req);
+    if (aiOff) return aiDisabled(reply); // hard kill-switch: no user content is processed while disabled
+    const b = (req.body ?? {}) as { message?: string; issue_id?: string };
+    if (typeof b.message !== 'string' || b.message.trim().length === 0 || b.message.length > 1000) {
+      throw new HttpError(400, 'message (1..1000 chars) is required.', 'bad_request');
+    }
+    // GUIDE-SCOPE chat: the chatbot is a multilingual PLATFORM
+    // GUIDE only. It must not read issue/report data, so issue context is rejected outright -
+    // capability isolation: this feature never gets another feature's data.
+    if (b.issue_id !== undefined) throw new HttpError(400, 'chat is a platform guide and does not read issue data.', 'bad_request');
+    const context: Record<string, unknown> | null = null;
+    const budget = admitInference(principal.userId);
+    if (!budget.ok) return reply.code(503).send({ ai_available: false, reason: budget.reason });
+    try {
+      const out = await aiChat(aiCfg(), { message: b.message.trim(), context });
+      return { ai_available: true, ...out };
+    } catch (e) { return aiUnavailable(reply, e); } finally { budget.done(); }
+  });
+
+  // Grievance email DRAFT. This service never sends mail: the response is text the citizen
+  // reviews, chooses a recipient for, and sends themselves. draft:true is part of the contract.
+  app.post('/v1/ai/email-draft', { bodyLimit: 8 * 1024 }, async (req, reply) => {
+    const principal = await auth(req);
+    if (aiOff) return aiDisabled(reply); // hard kill-switch: no user content is processed while disabled
+    const b = (req.body ?? {}) as { hazard?: string; note?: string; lat?: number; lon?: number; ward?: string; complaint_no?: string };
+    const hazardOk = typeof b.hazard === 'string' && (HAZARDS as readonly string[]).includes(b.hazard);
+    const latOk = typeof b.lat === 'number' && Number.isFinite(b.lat) && b.lat >= -90 && b.lat <= 90;
+    const lonOk = typeof b.lon === 'number' && Number.isFinite(b.lon) && b.lon >= -180 && b.lon <= 180;
+    if (!hazardOk || !latOk || !lonOk) throw new HttpError(400, 'hazard (known type), lat and lon are required.', 'bad_request');
+    if (b.note !== undefined && (typeof b.note !== 'string' || b.note.length > 2000)) throw new HttpError(400, 'note too long.', 'bad_request');
+    if (b.ward !== undefined && (typeof b.ward !== 'string' || b.ward.length > 120)) throw new HttpError(400, 'ward too long.', 'bad_request');
+    if (b.complaint_no !== undefined && (typeof b.complaint_no !== 'string' || b.complaint_no.length > 40)) throw new HttpError(400, 'complaint_no too long.', 'bad_request');
+    const budget = admitInference(principal.userId);
+    if (!budget.ok) return reply.code(503).send({ ai_available: false, reason: budget.reason });
+    try {
+      const out = await aiEmailDraft(aiCfg(), { hazard: b.hazard!, note: b.note, lat: b.lat!, lon: b.lon!, ward: b.ward, complaint_no: b.complaint_no });
+      return { ai_available: true, ...out }; // draft only - no recipient, no send path exists here
+    } catch (e) { return aiUnavailable(reply, e); } finally { budget.done(); }
+  });
+
+  // Staged-photo check. Vision gate: the configured model must advertise vision or this
+  // honestly reports model_not_vision - a text model pretending to see is the failure we refuse.
+  app.post('/v1/ai/image-check', { bodyLimit: 6 * 1024 * 1024 }, async (req, reply) => {
+    const principal = await auth(req);
+    if (aiOff) return aiDisabled(reply); // hard kill-switch: no user content is processed while disabled
+    const b = (req.body ?? {}) as { image_base64?: string; hazard?: string; note?: string };
+    if (typeof b.image_base64 !== 'string' || b.image_base64.length < 100 || b.image_base64.length > 5_800_000 || !/^[A-Za-z0-9+/=\r\n]+$/.test(b.image_base64)) {
+      throw new HttpError(400, 'image_base64 (100..5.8M base64 chars) is required.', 'bad_request');
+    }
+    if (b.hazard !== undefined && (typeof b.hazard !== 'string' || !(HAZARDS as readonly string[]).includes(b.hazard))) throw new HttpError(400, 'unknown hazard.', 'bad_request');
+    if (b.note !== undefined && (typeof b.note !== 'string' || b.note.length > 500)) throw new HttpError(400, 'note too long.', 'bad_request');
+    const budget = admitInference(principal.userId);
+    if (!budget.ok) return reply.code(503).send({ ai_available: false, reason: budget.reason });
+    try {
+      const out = await aiImageCheck(aiCfg(), { image_base64: b.image_base64.replace(/[\r\n]/g, ''), hazard: b.hazard, note: b.note });
+      return { ai_available: true, advisory: out };
+    } catch (e) { return aiUnavailable(reply, e); } finally { budget.done(); }
+  });
+
+  // Contractor brief. Retrieval boundary: rows come ONLY from the nhai_award_records registry
+  // query below. Zero rows short-circuits to found:false WITHOUT calling the model, so the
+  // model can never invent a track record. Candidate uncertainty warning travels with results.
+  app.post('/v1/ai/contractor-brief', { bodyLimit: 8 * 1024 }, async (req, reply) => {
+    const principal = await auth(req);
+    if (aiOff) return aiDisabled(reply); // hard kill-switch: no user content is processed while disabled
+    const b = (req.body ?? {}) as { contractor_name?: string };
+    if (typeof b.contractor_name !== 'string' || b.contractor_name.trim().length < 2 || b.contractor_name.length > 120) {
+      throw new HttpError(400, 'contractor_name (2..120 chars) is required.', 'bad_request');
+    }
+    const name = b.contractor_name.trim();
+    let rows: Record<string, unknown>[];
+    try {
+      const r = await db.query(
+        `SELECT project_name, state, length_km, loa_date::text, awarded_cost_cr, piu, mode, project_stage, project_type, source_label
+         FROM nhai_award_records WHERE contractor_name ILIKE $1 ORDER BY loa_date DESC NULLS LAST LIMIT 25`, [`%${name}%`]);
+      rows = r.rows;
+    } catch (e: any) {
+      if (e?.code === '42P01') return { ai_available: true, found: false, reason: 'registry_not_loaded', brief: null }; // table absent on this deployment: honest, not an error
+      throw e;
+    }
+    if (rows.length === 0) return { ai_available: true, found: false, reason: 'no_matching_records', brief: null };
+    const budget = admitInference(principal.userId);
+    if (!budget.ok) return reply.code(503).send({ ai_available: false, reason: budget.reason });
+    try {
+      const out = await aiContractorBrief(aiCfg(), rows);
+      return { ai_available: true, found: true, brief: out, candidate_warning: CANDIDATE_WARNING };
+    } catch (e) { return aiUnavailable(reply, e); } finally { budget.done(); }
+  });
 
   app.post('/v1/reports', async (req, reply) => {
     const p = await auth(req);
